@@ -61,7 +61,12 @@ Write everything in clear, simple English (translate any Tamil/Hindi; keep a Tam
 - topic: 1-3 lowercase words, e.g. "sales", "coding", "fitness", "ai tools". Reuse one of these existing topics if it fits: {topics}
 - summary: 2-3 sentences: what this is and the main lesson.
 - key_points: the actual useful advice, 3-10 points. Keep the specifics (numbers, names, exact steps, example lines to say). No vague filler.
-- content: {content_rule}"""
+- content: {content_rule}
+Accuracy rules (very important):
+- Only use what is actually said, written or shown in this item. Add nothing from your own knowledge.
+- Keep the creator's framing. When something is their opinion or claim, say so (e.g. "The creator claims…").
+- If a word, name or number is unclear, write [unclear] instead of guessing.
+- Never present a guess as a fact."""
 
 
 def _note_config(topics, content_rule):
@@ -121,7 +126,7 @@ def note_from_youtube(url, topics, caption=""):
         note.content = transcript
     else:
         # No captions: let Gemini watch the video itself (low resolution keeps long videos within free limits).
-        cfg = _note_config(topics, "detailed notes of everything useful that is said and shown, in order (this is the stored copy of the video).")
+        cfg = _note_config(topics, "a word-for-word transcript of everything spoken (translated to English if not English; mark unclear words as [unclear]), then a short list of any important text shown on screen. This is the stored original, so do not summarise it.")
         cfg.media_resolution = types.MediaResolution.MEDIA_RESOLUTION_LOW
         resp = _generate(contents=types.Content(parts=[
                 types.Part(file_data=types.FileData(file_uri=clean_url)),
@@ -163,7 +168,7 @@ def _upload(path, mime):
 
 def note_from_post(post, topics, caption=""):
     """post is a social.Post (Instagram reel/post or X post) with text and downloaded media."""
-    where = "Instagram reel/post" if post.kind == "instagram" else "X (Twitter) post"
+    where = {"instagram": "Instagram reel/post", "x": "X (Twitter) post", "linkedin": "LinkedIn post"}[post.kind]
     intro = f"{where} by {post.author or 'unknown'}.\nPost text / caption:\n{post.text or '(none)'}"
     if caption:
         intro += f"\n\nArun's own comment when saving: {caption}"
@@ -178,8 +183,7 @@ def note_from_post(post, topics, caption=""):
                 uploaded.append(f)
                 parts.append(types.Part(file_data=types.FileData(file_uri=f.uri, mime_type=mime)))
         has_video = bool(uploaded)
-        rule = ("detailed notes of everything useful that is said and shown in the video, in order, "
-                "plus the post text (this is the stored copy)." if has_video else
+        rule = ("the post text, then " + "a word-for-word transcript of everything spoken (translated to English if not English; mark unclear words as [unclear]), then a short list of any important text shown on screen. This is the stored original, so do not summarise it." if has_video else
                 "the full post text plus any text in the images, word for word.")
         resp = _generate(contents=parts + [intro + "\n\nMake a note of this post."],
                          config=_note_config(topics, rule))

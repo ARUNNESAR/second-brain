@@ -41,12 +41,13 @@ MAX_MSG = 4000
 
 HELP = """Your Second Brain 🧠
 
-SAVE: share a YouTube video (Shorts or long) or send a screenshot. Add a comment with it if you like.
+SAVE: share a YouTube video, Instagram reel, X post or LinkedIn post, or send a screenshot. Add a comment with it if you like.
 NOTE: /note <text> saves your own thought.
 ASK: just type a question, e.g. "how do I handle price objections?"
 
 /recent  last 10 saves
 /export  download everything as a file
+/fix <number> <correction>  correct a note that got something wrong
 /delete <number>  remove a save
 /retry  try again on saves that failed to read
 /recap  recap of the last 7 days (it also comes by itself every Sunday 9 AM)"""
@@ -122,7 +123,7 @@ async def save_link(update, url, caption):
         # Other sites (Reddit, articles…) can't be read yet. Keep the link so it can be processed later.
         save_id = await asyncio.to_thread(db.add, "link", url, url, None, None, None, caption, None, "pending")
         await update.message.reply_text(
-            f"📌 Kept the link as #{save_id}.\nI can read YouTube, Instagram and X links and screenshots. "
+            f"📌 Kept the link as #{save_id}.\nI can read YouTube, Instagram, X and LinkedIn links and screenshots. "
             f"For this site, send a screenshot and I'll save what it says.")
         return
     clean = social.clean_url(url)
@@ -210,7 +211,7 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("Nothing saved yet.")
         return
-    icons = {"youtube": "▶️", "image": "🖼", "note": "📝", "link": "🔗"}
+    icons = {"youtube": "▶️", "image": "🖼", "note": "📝", "link": "🔗", "instagram": "📸", "x": "𝕏", "linkedin": "💼"}
     lines = [f"#{i} {icons.get(t, '•')} {title or '(untitled)'}"
              + (f" · {topic}" if topic else "") + (" (not read yet)" if st == "pending" else "")
              + f" · {created:%d %b}"
@@ -244,6 +245,23 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     gone = await asyncio.to_thread(db.delete, int(arg))
     await update.message.reply_text(f"🗑 Deleted #{arg}: {gone[0]}" if gone else f"No save #{arg} found.")
+
+
+async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if len(args) < 2 or not args[0].lstrip("#").isdigit():
+        await update.message.reply_text(
+            "Write the number and the correction, like:\n/fix 12 He said 50 conversations, not 100")
+        return
+    save_id, text = int(args[0].lstrip("#")), " ".join(args[1:])
+    row = await asyncio.to_thread(db.add_correction, save_id, text)
+    if not row:
+        await update.message.reply_text(f"No save #{save_id} found.")
+        return
+    title, topic, summary, points = row
+    vec = await asyncio.to_thread(brain.embed, f"{title}\nTopic: {topic}\n{summary}\n" + "\n".join(points))
+    await asyncio.to_thread(db.set_embedding, save_id, vec)
+    await update.message.reply_text(f"✏️ Fixed #{save_id}: {title}\nYour correction is now part of the note.")
 
 
 async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -324,6 +342,7 @@ async def set_menu(app):
         ("recent", "Last 10 saves"),
         ("note", "Save your own note"),
         ("export", "Download everything"),
+        ("fix", "Correct a note, e.g. /fix 12 …"),
         ("delete", "Remove a save, e.g. /delete 12"),
         ("recap", "Recap of the last 7 days"),
         ("retry", "Retry saves that failed"),
@@ -344,6 +363,7 @@ def build_app():
     app.add_handler(CommandHandler("delete", cmd_delete, filters=me))
     app.add_handler(CommandHandler("retry", cmd_retry, filters=me))
     app.add_handler(CommandHandler("recap", cmd_recap, filters=me))
+    app.add_handler(CommandHandler("fix", cmd_fix, filters=me))
     app.add_handler(MessageHandler(me & (filters.PHOTO | filters.Document.IMAGE), on_image))
     app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(~me, ignore_strangers))

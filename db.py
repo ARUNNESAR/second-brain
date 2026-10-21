@@ -128,6 +128,20 @@ def all_saves():
         ).fetchall()
 
 
+def add_correction(save_id, text):
+    """Arun's correction becomes the first key point, so search and answers see it."""
+    with _connect() as c:
+        return c.execute(
+            """update saves set key_points = array_prepend(%s, coalesce(key_points, '{}'))
+               where id = %s returning title, topic, summary, key_points""",
+            (f"CORRECTION by Arun: {text}", save_id)).fetchone()
+
+
+def set_embedding(save_id, embedding):
+    with _connect() as c:
+        c.execute("update saves set embedding = %s where id = %s", (_vec(embedding), save_id))
+
+
 def delete(save_id):
     with _connect() as c:
         return c.execute("delete from saves where id = %s returning title", (save_id,)).fetchone()

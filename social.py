@@ -19,13 +19,14 @@ MAX_BYTES = 60 * 1024 * 1024  # skip media bigger than 60 MB
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
 INSTAGRAM_RE = re.compile(r"instagram\.com/(?:[\w.]+/)?(reels?|p|tv)/([\w-]+)", re.I)
+LINKEDIN_RE = re.compile(r"(?:linkedin\.com/(?:posts|pulse|feed/update|embed/feed/update)/|lnkd\.in/)[^\s?#]+", re.I)
 X_RE = re.compile(r"(?:twitter|x|fxtwitter|vxtwitter|fixupx)\.com/(\w+)/status(?:es)?/(\d+)", re.I)
 
 
 @dataclass
 class Post:
     url: str                       # clean link we store
-    kind: str                      # instagram | x
+    kind: str                      # instagram | x | linkedin
     author: str = ""
     text: str = ""
     media: list = field(default_factory=list)   # [(path, mime)]
@@ -42,6 +43,8 @@ def kind_of(url):
         return "instagram"
     if X_RE.search(url):
         return "x"
+    if LINKEDIN_RE.search(url):
+        return "linkedin"
     return None
 
 
@@ -53,6 +56,9 @@ def clean_url(url):
     m = X_RE.search(url)
     if m:
         return f"https://x.com/{m.group(1)}/status/{m.group(2)}"
+    m = LINKEDIN_RE.search(url)
+    if m:
+        return "https://www." + m.group(0) if m.group(0).lower().startswith("linkedin") else "https://" + m.group(0)
     return url
 
 
@@ -169,8 +175,67 @@ def _x_oembed(url):
         return ""
 
 
+# ---------- LinkedIn ----------
+
+def fetch_linkedin(url):
+    """Public LinkedIn posts/articles carry their full text in the page's structured data (no login needed)."""
+    post = Post(url=clean_url(url), kind="linkedin", workdir=_workdir())
+    try:
+        resp = _get(post.url)
+        final = resp.geturl()  # lnkd.in short links redirect to the real post
+        if "authwall" in final or "/login" in final:
+            raise RuntimeError("LinkedIn asked for a login")
+        if "linkedin.com" in final:
+            post.url = final.split("?")[0]
+        page = resp.read(2_000_000).decode("utf-8", "ignore")
+    except Exception as e:
+        post.cleanup()
+        raise RuntimeError(f"LinkedIn blocked this one ({str(e)[:60]}). Send a screenshot instead.")
+
+    images, videos = [], []
+    for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', page, re.S):
+        try:
+            d = json.loads(m.group(1))
+        except Exception:
+            continue
+        if d.get("articleBody") or d.get("text"):
+            post.text = (d.get("headline", "") + "\n\n" if d.get("@type") == "Article" else "") + \
+                (d.get("articleBody") or d.get("text"))
+            a = d.get("author") or {}
+            post.author = (a[0] if isinstance(a, list) and a else a).get("name", "") if a else ""
+            img = d.get("image")
+            for i in (img if isinstance(img, list) else [img] if img else []):
+                images.append(i.get("url") if isinstance(i, dict) else i)
+            vid = d.get("video")
+            for v in (vid if isinstance(vid, list) else [vid] if vid else []):
+                if isinstance(v, dict) and v.get("contentUrl"):
+                    videos.append(v["contentUrl"])
+    if not post.text:  # fall back to the link-preview text
+        m = re.search(r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"', page)
+        post.text = html.unescape(m.group(1)).strip() if m else ""
+    if not videos:  # LinkedIn's own video player lists its files in data-sources
+        m = re.search(r'data-sources="([^"]+)"', page)
+        if m:
+            try:
+                srcs = json.loads(html.unescape(m.group(1)))
+                videos.append(sorted(srcs, key=lambda s: s.get("data-bitrate", 0))[-1]["src"])
+            except Exception:
+                pass
+    try:
+        if videos:
+            post.media.append((_download(videos[0], os.path.join(post.workdir, "v0.mp4")), "video/mp4"))
+        for i, u in enumerate([u for u in images if u][:4]):
+            post.media.append((_download(u, os.path.join(post.workdir, f"p{i}.jpg")), "image/jpeg"))
+    except Exception as e:
+        post.note = f"couldn't download the media ({str(e)[:60]})"
+    if not post.text and not post.media:
+        post.cleanup()
+        raise RuntimeError("Couldn't read that LinkedIn post (private or login-only?). Send a screenshot instead.")
+    return post
+
+
 def fetch(url):
-    return fetch_instagram(url) if kind_of(url) == "instagram" else fetch_x(url)
+    return {"instagram": fetch_instagram, "x": fetch_x, "linkedin": fetch_linkedin}[kind_of(url)](url)
 
 
 def make_note(url, topics, caption=""):
