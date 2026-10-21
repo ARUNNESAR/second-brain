@@ -1,0 +1,197 @@
+"""The thinking part: Gemini reads videos/images, writes notes, makes embeddings, answers questions."""
+import json
+import os
+import re
+import time
+import urllib.parse
+import urllib.request
+
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi
+
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+EMBED_MODEL = "gemini-embedding-001"
+EMBED_DIM = 768
+
+# If the main model is busy or out of free quota, try the next one.
+FALLBACK_MODELS = [MODEL, "gemini-3.5-flash", "gemini-flash-lite-latest"]
+
+_client = None
+
+
+def client():
+    global _client
+    if _client is None:
+        # Without a timeout a stuck request can hang forever; 4 min is enough for a 1-hour video.
+        _client = genai.Client(
+            api_key=os.environ["GEMINI_API_KEY"].strip(),
+            http_options=types.HttpOptions(timeout=240_000, retry_options=types.HttpRetryOptions(attempts=2)),
+        )
+    return _client
+
+
+def _generate(contents, config):
+    last = None
+    for attempt, model in enumerate(dict.fromkeys(FALLBACK_MODELS)):
+        try:
+            return client().models.generate_content(model=model, contents=contents, config=config)
+        except Exception as e:  # busy (503), quota (429) or model gone (404): move on
+            s = str(e)
+            if not any(code in s for code in ("503", "504", "429", "404", "UNAVAILABLE", "RESOURCE_EXHAUSTED",
+                                              "DEADLINE", "imeout")):
+                raise
+            last = e
+            time.sleep(2 * (attempt + 1))
+    raise last
+
+
+class Note(BaseModel):
+    title: str
+    topic: str
+    summary: str
+    key_points: list[str]
+    content: str
+
+
+NOTE_RULES = """You are filling Arun's personal knowledge base. He saves things to learn from them later.
+Write everything in clear, simple English (translate any Tamil/Hindi; keep a Tamil phrase only if it matters).
+- title: short and specific (max 10 words).
+- topic: 1-3 lowercase words, e.g. "sales", "coding", "fitness", "ai tools". Reuse one of these existing topics if it fits: {topics}
+- summary: 2-3 sentences: what this is and the main lesson.
+- key_points: the actual useful advice, 3-10 points. Keep the specifics (numbers, names, exact steps, example lines to say). No vague filler.
+- content: {content_rule}"""
+
+
+def _note_config(topics, content_rule):
+    return types.GenerateContentConfig(
+        system_instruction=NOTE_RULES.format(topics=", ".join(topics) or "none yet", content_rule=content_rule),
+        response_mime_type="application/json",
+        response_schema=Note,
+    )
+
+
+def _parse(resp):
+    return resp.parsed if resp.parsed else Note(**json.loads(resp.text))
+
+
+# ---------- YouTube ----------
+
+def youtube_id(url):
+    m = re.search(r"(?:youtu\.be/|youtube\.com/(?:watch\?(?:.*&)?v=|shorts/|live/|embed/))([\w-]{11})", url)
+    return m.group(1) if m else None
+
+
+def youtube_title(url):
+    try:
+        q = "https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(url, safe="")
+        return json.load(urllib.request.urlopen(q, timeout=10)).get("title")
+    except Exception:
+        return None
+
+
+def youtube_transcript(video_id):
+    """Spoken words of the video. Free and cheap; None if the video has no captions."""
+    try:
+        api = YouTubeTranscriptApi()
+        tlist = api.list(video_id)
+        try:
+            t = tlist.find_transcript(["en", "en-IN", "en-US", "en-GB", "ta", "hi"])
+        except Exception:
+            t = next(iter(tlist))
+        return " ".join(s.text for s in t.fetch()).replace("\n", " ")
+    except Exception:
+        return None
+
+
+def note_from_youtube(url, topics, caption=""):
+    vid = youtube_id(url)
+    clean_url = f"https://www.youtube.com/watch?v={vid}"
+    yt_title = youtube_title(clean_url)
+    transcript = youtube_transcript(vid)
+    extra = f"\nArun's own comment when saving: {caption}" if caption else ""
+
+    if transcript and len(transcript) > 200:
+        # Cheap route: read the transcript as text.
+        resp = _generate(contents=f"YouTube video: {yt_title or clean_url}{extra}\n\nTranscript:\n{transcript[:400_000]}",
+            config=_note_config(topics, "write an empty string (the transcript is stored separately)."),
+        )
+        note = _parse(resp)
+        note.content = transcript
+    else:
+        # No captions: let Gemini watch the video itself (low resolution keeps long videos within free limits).
+        cfg = _note_config(topics, "detailed notes of everything useful that is said and shown, in order (this is the stored copy of the video).")
+        cfg.media_resolution = types.MediaResolution.MEDIA_RESOLUTION_LOW
+        resp = _generate(contents=types.Content(parts=[
+                types.Part(file_data=types.FileData(file_uri=clean_url)),
+                types.Part(text=f"Make a note of this video.{extra}"),
+            ]),
+            config=cfg,
+        )
+        note = _parse(resp)
+    if yt_title and not note.title:
+        note.title = yt_title
+    return note, clean_url
+
+
+# ---------- Images ----------
+
+def note_from_image(image_bytes, mime, topics, caption=""):
+    extra = f"\nArun's own comment when saving: {caption}" if caption else ""
+    resp = _generate(contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime),
+                  f"Make a note of this screenshot.{extra}"],
+        config=_note_config(topics, "all the readable text in the image, word for word."),
+    )
+    return _parse(resp)
+
+
+# ---------- Plain notes ----------
+
+def note_from_text(text, topics):
+    resp = _generate(contents=f"Arun typed this note to remember:\n{text}",
+        config=_note_config(topics, "Arun's note exactly as he typed it."),
+    )
+    note = _parse(resp)
+    note.content = text
+    return note
+
+
+# ---------- Embeddings + answers ----------
+
+def embed(text, for_query=False):
+    r = client().models.embed_content(
+        model=EMBED_MODEL,
+        contents=text[:8000],
+        config=types.EmbedContentConfig(
+            output_dimensionality=EMBED_DIM,
+            task_type="RETRIEVAL_QUERY" if for_query else "RETRIEVAL_DOCUMENT",
+        ),
+    )
+    return r.embeddings[0].values
+
+
+def note_text_for_search(note):
+    return f"{note.title}\nTopic: {note.topic}\n{note.summary}\n" + "\n".join(note.key_points)
+
+
+ANSWER_RULES = """You are Arun's second brain. Answer his question using ONLY the saved notes below.
+- Plain, friendly English. Short: get to the useful advice fast. Use bullet points for steps.
+- After each fact, cite the note number like [1] or [2].
+- If the notes don't answer the question, say so honestly in one line, then mention the closest thing he did save (if any).
+- Never invent advice that isn't in the notes.
+- Plain text only: no markdown headings, no ** bold **, no tables."""
+
+
+def answer(question, rows):
+    blocks = []
+    for i, r in enumerate(rows, 1):
+        _, created, stype, url, title, topic, summary, points, content, _ = r
+        body = f"[{i}] {title} ({stype}, saved {created:%d %b %Y}, topic: {topic})\nSummary: {summary}\nKey points:\n- " + "\n- ".join(points or [])
+        if content:
+            body += f"\nOriginal (excerpt): {content[:6000]}"
+        blocks.append(body)
+    resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + f"\n\nArun's question: {question}",
+        config=types.GenerateContentConfig(system_instruction=ANSWER_RULES),
+    )
+    return resp.text.strip()

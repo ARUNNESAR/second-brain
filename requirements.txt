@@ -1,0 +1,9 @@
+python-telegram-bot[job-queue]==22.8
+google-genai==2.31.0
+psycopg[binary]
+pgvector==0.5.1
+python-dotenv
+youtube-transcript-api==1.2.4
+mcp==2.3.0
+uvicorn==0.54.0
+starlette==1.9.0
