@@ -24,6 +24,7 @@ from telegram import Update  # noqa: E402
 
 import brain  # noqa: E402
 import db  # noqa: E402
+import social  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs URLs that contain the bot token
@@ -100,18 +101,25 @@ async def list_topics() -> str:
 
 
 @mcp.tool()
-async def save_to_brain(text_or_youtube_link: str) -> str:
+async def save_to_brain(text_or_link: str) -> str:
     """Save something new into Arun's second brain. Only use when he asks you to save/remember something.
-    Give a YouTube link (it will be watched and summarised) or plain text (saved as his note)."""
+    Give a YouTube, Instagram (reel/post) or X (Twitter) link (it will be watched/read and summarised),
+    or plain text (saved as his note)."""
     topics = await asyncio.to_thread(db.topics)
-    url = next((w for w in text_or_youtube_link.split() if brain.youtube_id(w)), None)
-    if url:
-        note, clean = await asyncio.to_thread(brain.note_from_youtube, url, topics)
-        stype, link = "youtube", clean
-        if await asyncio.to_thread(db.find_url, clean):
+    words = text_or_link.split()
+    yt = next((w for w in words if brain.youtube_id(w)), None)
+    post = next((w for w in words if social.kind_of(w)), None)
+    if yt:
+        if await asyncio.to_thread(db.find_url, f"https://www.youtube.com/watch?v={brain.youtube_id(yt)}"):
             return "That video is already saved."
+        note, link = await asyncio.to_thread(brain.note_from_youtube, yt, topics)
+        stype = "youtube"
+    elif post:
+        if await asyncio.to_thread(db.find_url, social.clean_url(post)):
+            return "That post is already saved."
+        note, link, stype, _ = await asyncio.to_thread(social.make_note, post, topics)
     else:
-        note = await asyncio.to_thread(brain.note_from_text, text_or_youtube_link, topics)
+        note = await asyncio.to_thread(brain.note_from_text, text_or_link, topics)
         stype, link = "note", None
     vec = await asyncio.to_thread(brain.embed, brain.note_text_for_search(note))
     i = await asyncio.to_thread(db.add, stype, link, note.title, note.topic, note.summary, note.key_points,

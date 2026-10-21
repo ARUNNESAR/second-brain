@@ -146,6 +146,52 @@ def note_from_image(image_bytes, mime, topics, caption=""):
     return _parse(resp)
 
 
+# ---------- Instagram / X posts ----------
+
+def _upload(path, mime):
+    """Videos go through Gemini's file upload; wait until Gemini has processed them."""
+    f = client().files.upload(file=path, config=types.UploadFileConfig(mime_type=mime))
+    for _ in range(60):
+        if f.state and f.state.name == "ACTIVE":
+            return f
+        if f.state and f.state.name == "FAILED":
+            raise RuntimeError("Gemini couldn't process the video")
+        time.sleep(2)
+        f = client().files.get(name=f.name)
+    raise RuntimeError("Gemini took too long to process the video")
+
+
+def note_from_post(post, topics, caption=""):
+    """post is a social.Post (Instagram reel/post or X post) with text and downloaded media."""
+    where = "Instagram reel/post" if post.kind == "instagram" else "X (Twitter) post"
+    intro = f"{where} by {post.author or 'unknown'}.\nPost text / caption:\n{post.text or '(none)'}"
+    if caption:
+        intro += f"\n\nArun's own comment when saving: {caption}"
+    parts, uploaded = [], []
+    try:
+        for path, mime in post.media:
+            if mime.startswith("image/"):
+                with open(path, "rb") as fh:
+                    parts.append(types.Part.from_bytes(data=fh.read(), mime_type=mime))
+            else:
+                f = _upload(path, mime)
+                uploaded.append(f)
+                parts.append(types.Part(file_data=types.FileData(file_uri=f.uri, mime_type=mime)))
+        has_video = bool(uploaded)
+        rule = ("detailed notes of everything useful that is said and shown in the video, in order, "
+                "plus the post text (this is the stored copy)." if has_video else
+                "the full post text plus any text in the images, word for word.")
+        resp = _generate(contents=parts + [intro + "\n\nMake a note of this post."],
+                         config=_note_config(topics, rule))
+        return _parse(resp)
+    finally:
+        for f in uploaded:  # don't leave copies on Google's side
+            try:
+                client().files.delete(name=f.name)
+            except Exception:
+                pass
+
+
 # ---------- Plain notes ----------
 
 def note_from_text(text, topics):

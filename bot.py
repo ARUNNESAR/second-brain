@@ -22,6 +22,7 @@ from telegram.ext import (Application, CommandHandler, ContextTypes, MessageHand
 
 import brain  # noqa: E402
 import db  # noqa: E402
+import social  # noqa: E402
 
 os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)
 logging.basicConfig(
@@ -116,11 +117,34 @@ async def save_youtube(update, url, caption):
 
 
 async def save_link(update, url, caption):
-    # Step 1 can't read Instagram / X / Reddit yet. Keep the link so it can be processed later.
-    save_id = await asyncio.to_thread(db.add, "link", url, url, None, None, None, caption, None, "pending")
-    await update.message.reply_text(
-        f"📌 Kept the link as #{save_id}.\nRight now I can only read YouTube videos and screenshots. "
-        f"Tip: send a screenshot of the post and I'll save what it says.")
+    kind = social.kind_of(url)
+    if not kind:
+        # Other sites (Reddit, articles…) can't be read yet. Keep the link so it can be processed later.
+        save_id = await asyncio.to_thread(db.add, "link", url, url, None, None, None, caption, None, "pending")
+        await update.message.reply_text(
+            f"📌 Kept the link as #{save_id}.\nI can read YouTube, Instagram and X links and screenshots. "
+            f"For this site, send a screenshot and I'll save what it says.")
+        return
+    clean = social.clean_url(url)
+    dup = await asyncio.to_thread(db.find_url, clean)
+    if dup:
+        await update.message.reply_text(f"Already saved as #{dup[0]}: {dup[1]}")
+        return
+    label = "reel" if kind == "instagram" else "post"
+    status = await update.message.reply_text(f"⏳ Reading the {label}… (up to a minute)")
+    try:
+        topics = await asyncio.to_thread(db.topics)
+        note, clean, kind, warning = await asyncio.to_thread(social.make_note, url, topics, caption)
+        save_id = await _store(note, kind, clean)
+        reply = _saved_reply(save_id, note)
+        if warning:
+            reply += f"\n\n(Only the caption/text could be read: {warning}.)"
+        await status.edit_text(_short(reply))
+    except Exception as e:
+        log.exception("%s save failed", kind)
+        save_id = await asyncio.to_thread(db.add, kind, clean, clean, None, None, None, caption, None, "pending")
+        await status.edit_text(f"{_friendly_error(e)}\n\nI kept the link as #{save_id}. Send /retry later, "
+                               f"or send a screenshot of it.")
 
 
 async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -223,16 +247,21 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = [r for r in await asyncio.to_thread(db.pending) if r[1] == "youtube"]
+    # YouTube, Instagram and X links that failed earlier (including links kept before reels/X were supported)
+    rows = [r for r in await asyncio.to_thread(db.pending)
+            if r[1] == "youtube" or social.kind_of(r[2] or "")]
     if not rows:
         await update.message.reply_text("Nothing to retry. 👍")
         return
-    status = await update.message.reply_text(f"⏳ Retrying {len(rows)} video(s)…")
+    status = await update.message.reply_text(f"⏳ Retrying {len(rows)} link(s)…")
     done, failed = 0, 0
     topics = await asyncio.to_thread(db.topics)
-    for save_id, _, url, caption in rows:
+    for save_id, stype, url, caption in rows:
         try:
-            note, _ = await asyncio.to_thread(brain.note_from_youtube, url, topics, caption or "")
+            if stype == "youtube":
+                note, _ = await asyncio.to_thread(brain.note_from_youtube, url, topics, caption or "")
+            else:
+                note, *_ = await asyncio.to_thread(social.make_note, url, topics, caption or "")
             vec = await asyncio.to_thread(brain.embed, brain.note_text_for_search(note))
             await asyncio.to_thread(db.update_note, save_id, note.title, note.topic, note.summary,
                                     note.key_points, note.content, vec)
