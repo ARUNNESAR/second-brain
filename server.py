@@ -30,7 +30,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs URLs that con
 log = logging.getLogger("brain-server")
 
 MCP_SECRET = os.environ["MCP_SECRET"].strip()
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").strip().rstrip("/")  # e.g. https://arun-brain.onrender.com
+WEBHOOK_URL = (os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")).strip().rstrip("/")  # Render fills RENDER_EXTERNAL_URL itself
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
 
 mcp = MCPServer(
