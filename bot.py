@@ -63,6 +63,8 @@ def _friendly_error(e):
         return "Gemini's free limit is used up for now. Try again in a minute (or tomorrow if it keeps happening)."
     if "503" in s or "UNAVAILABLE" in s or "overloaded" in s.lower():
         return "Gemini is busy right now. Try again in a minute."
+    if isinstance(e, social.Blocked):
+        return f"⚠️ {s}"
     return f"Something went wrong: {s[:200]}"
 
 
@@ -72,8 +74,21 @@ def _saved_reply(save_id, note):
     return _short(f"✅ Saved #{save_id} · {note.topic}\n{note.title}\n\n{note.summary}\n\n{points}{more}")
 
 
-async def _store(note, source_type, url):
+def _make_note(url, kind, caption):
+    """Any supported link -> (note, clean_url, kind, warning). Runs in a worker thread."""
+    topics = db.topics()
+    if kind == "youtube":
+        note, clean = brain.note_from_youtube(url, topics, caption)
+        return note, clean, "youtube", ""
+    return social.make_note(url, topics, caption)
+
+
+async def _store(note, source_type, url, pending_id=None):
     vec = await asyncio.to_thread(brain.embed, brain.note_text_for_search(note))
+    if pending_id:  # this link failed before: fill in the same save number
+        await asyncio.to_thread(db.update_note, pending_id, note.title, note.topic, note.summary,
+                                note.key_points, note.content, vec)
+        return pending_id
     return await asyncio.to_thread(db.add, source_type, url, note.title, note.topic, note.summary,
                                    note.key_points, note.content, vec)
 
@@ -96,25 +111,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask(update, text)
 
 
-async def save_youtube(update, url, caption):
-    vid = brain.youtube_id(url)
-    clean = f"https://www.youtube.com/watch?v={vid}"
-    dup = await asyncio.to_thread(db.find_url, clean)
-    if dup:
-        await update.message.reply_text(f"Already saved as #{dup[0]}: {dup[1]}")
+async def _save_url(update, url, clean, kind, caption, label):
+    """Save a YouTube / Instagram / X / LinkedIn link. A link that failed before is retried, not called a duplicate."""
+    found = await asyncio.to_thread(db.find_url, clean)
+    if found and found[2] == "done":
+        await update.message.reply_text(f"Already saved as #{found[0]}: {found[1]}")
         return
-    status = await update.message.reply_text("⏳ Watching the video… (long videos take up to a minute)")
+    pending_id = found[0] if found else None
+    status = await update.message.reply_text(f"⏳ Reading the {label}… (up to a minute)")
     try:
-        topics = await asyncio.to_thread(db.topics)
-        note, clean = await asyncio.to_thread(brain.note_from_youtube, url, topics, caption)
-        save_id = await _store(note, "youtube", clean)
-        await status.edit_text(_saved_reply(save_id, note))
+        note, clean, kind, warning = await asyncio.to_thread(_make_note, url, kind, caption)
+        save_id = await _store(note, kind, clean, pending_id)
+        reply = _saved_reply(save_id, note)
+        if warning:
+            reply += f"\n\n(Only the caption/text could be read: {warning}.)"
+        await status.edit_text(_short(reply))
     except Exception as e:
-        log.exception("youtube save failed")
-        # Keep the link so nothing is lost; /retry can process it later.
-        save_id = await asyncio.to_thread(db.add, "youtube", clean, brain.youtube_title(clean) or clean, None,
-                                          None, None, caption, None, "pending")
-        await status.edit_text(f"{_friendly_error(e)}\n\nI kept the link as #{save_id}. Send /retry later.")
+        log.exception("%s save failed", kind)
+        if not pending_id:  # keep the link so nothing is lost; the auto-retry picks it up
+            pending_id = await asyncio.to_thread(db.add, kind, clean, clean, None, None, None, caption, None, "pending")
+        await status.edit_text(f"{_friendly_error(e)}\n\n📌 Kept the link as #{pending_id}. I'll retry it "
+                               f"automatically every few hours and message you when it's saved.")
+
+
+async def save_youtube(update, url, caption):
+    clean = f"https://www.youtube.com/watch?v={brain.youtube_id(url)}"
+    await _save_url(update, url, clean, "youtube", caption, "video")
 
 
 async def save_link(update, url, caption):
@@ -126,26 +148,7 @@ async def save_link(update, url, caption):
             f"📌 Kept the link as #{save_id}.\nI can read YouTube, Instagram, X and LinkedIn links and screenshots. "
             f"For this site, send a screenshot and I'll save what it says.")
         return
-    clean = social.clean_url(url)
-    dup = await asyncio.to_thread(db.find_url, clean)
-    if dup:
-        await update.message.reply_text(f"Already saved as #{dup[0]}: {dup[1]}")
-        return
-    label = "reel" if kind == "instagram" else "post"
-    status = await update.message.reply_text(f"⏳ Reading the {label}… (up to a minute)")
-    try:
-        topics = await asyncio.to_thread(db.topics)
-        note, clean, kind, warning = await asyncio.to_thread(social.make_note, url, topics, caption)
-        save_id = await _store(note, kind, clean)
-        reply = _saved_reply(save_id, note)
-        if warning:
-            reply += f"\n\n(Only the caption/text could be read: {warning}.)"
-        await status.edit_text(_short(reply))
-    except Exception as e:
-        log.exception("%s save failed", kind)
-        save_id = await asyncio.to_thread(db.add, kind, clean, clean, None, None, None, caption, None, "pending")
-        await status.edit_text(f"{_friendly_error(e)}\n\nI kept the link as #{save_id}. Send /retry later, "
-                               f"or send a screenshot of it.")
+    await _save_url(update, url, social.clean_url(url), kind, caption, "reel" if kind == "instagram" else "post")
 
 
 async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -264,30 +267,45 @@ async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✏️ Fixed #{save_id}: {title}\nYour correction is now part of the note.")
 
 
-async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # YouTube, Instagram and X links that failed earlier (including links kept before reels/X were supported)
+async def retry_pending():
+    """Try all failed YouTube / Instagram / X / LinkedIn links again. Returns (saved [(id, note)], still_failing)."""
     rows = [r for r in await asyncio.to_thread(db.pending)
             if r[1] == "youtube" or social.kind_of(r[2] or "")]
-    if not rows:
-        await update.message.reply_text("Nothing to retry. 👍")
-        return
-    status = await update.message.reply_text(f"⏳ Retrying {len(rows)} link(s)…")
-    done, failed = 0, 0
-    topics = await asyncio.to_thread(db.topics)
+    saved, failed = [], 0
     for save_id, stype, url, caption in rows:
+        kind = "youtube" if stype == "youtube" else social.kind_of(url)
         try:
-            if stype == "youtube":
-                note, _ = await asyncio.to_thread(brain.note_from_youtube, url, topics, caption or "")
-            else:
-                note, *_ = await asyncio.to_thread(social.make_note, url, topics, caption or "")
-            vec = await asyncio.to_thread(brain.embed, brain.note_text_for_search(note))
-            await asyncio.to_thread(db.update_note, save_id, note.title, note.topic, note.summary,
-                                    note.key_points, note.content, vec)
-            done += 1
+            note, clean, kind, _ = await asyncio.to_thread(_make_note, url, kind, caption or "")
+            await _store(note, kind, clean, save_id)
+            saved.append((save_id, note))
         except Exception:
             log.exception("retry failed for #%s", save_id)
             failed += 1
-    await status.edit_text(f"Retry finished: {done} saved" + (f", {failed} still failing" if failed else "") + ".")
+        await asyncio.sleep(20)  # go slowly so Instagram doesn't block us again
+    return saved, failed
+
+
+async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text("⏳ Retrying links that failed…")
+    saved, failed = await retry_pending()
+    if not saved and not failed:
+        await status.edit_text("Nothing to retry. 👍")
+        return
+    lines = [f"✅ #{i} {n.title}" for i, n in saved]
+    if failed:
+        lines.append(f"⚠️ {failed} still blocked. I'll keep retrying automatically.")
+    await status.edit_text(_short("\n".join(lines)))
+
+
+async def auto_retry(context: ContextTypes.DEFAULT_TYPE):
+    # Every 2 hours: retry what failed (usually Instagram's temporary block) and tell Arun what got saved.
+    try:
+        saved, _ = await retry_pending()
+        for save_id, note in saved:
+            await context.bot.send_message(OWNER, _saved_reply(save_id, note).replace("✅ Saved", "🔁 Saved later", 1),
+                                           disable_web_page_preview=True)
+    except Exception:
+        log.exception("auto retry failed")
 
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
@@ -371,6 +389,7 @@ def build_app():
     app.job_queue.run_daily(daily_ping, time=dt.time(hour=3, minute=0))
     app.job_queue.run_once(daily_ping, when=5)
     # Every Sunday 9:00 AM India time (0 = Sunday)
+    app.job_queue.run_repeating(auto_retry, interval=2 * 60 * 60, first=10 * 60)
     app.job_queue.run_daily(weekly_recap, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(0,))
     return app
 

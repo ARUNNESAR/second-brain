@@ -72,7 +72,7 @@ def update_note(save_id, title, topic, summary, key_points, content, embedding):
 
 def find_url(url):
     with _connect() as c:
-        return c.execute("select id, title from saves where source_url = %s limit 1", (url,)).fetchone()
+        return c.execute("select id, title, status from saves where source_url = %s order by status = 'done' desc limit 1", (url,)).fetchone()
 
 
 def search(embedding, limit=6):

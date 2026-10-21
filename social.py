@@ -23,6 +23,10 @@ LINKEDIN_RE = re.compile(r"(?:linkedin\.com/(?:posts|pulse|feed/update|embed/fee
 X_RE = re.compile(r"(?:twitter|x|fxtwitter|vxtwitter|fixupx)\.com/(\w+)/status(?:es)?/(\d+)", re.I)
 
 
+class Blocked(RuntimeError):
+    """The site refused us (rate limit / login wall). Usually temporary, so the link is retried later."""
+
+
 @dataclass
 class Post:
     url: str                       # clean link we store
@@ -118,7 +122,7 @@ def fetch_instagram(url):
         post.text = _instagram_caption(post.url)
     if not post.media and not post.text:
         post.cleanup()
-        raise RuntimeError("Instagram blocked this one (no video and no caption). Send a screenshot instead.")
+        raise Blocked("Instagram is blocking my server right now (it does this after several reels in a row).")
     return post
 
 
@@ -190,7 +194,7 @@ def fetch_linkedin(url):
         page = resp.read(2_000_000).decode("utf-8", "ignore")
     except Exception as e:
         post.cleanup()
-        raise RuntimeError(f"LinkedIn blocked this one ({str(e)[:60]}). Send a screenshot instead.")
+        raise Blocked(f"LinkedIn is blocking my server right now ({str(e)[:60]}).")
 
     images, videos = [], []
     for m in re.finditer(r'<script type="application/ld\+json">(.*?)</script>', page, re.S):
