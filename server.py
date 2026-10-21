@@ -107,7 +107,7 @@ def _done(found):
 @mcp.tool()
 async def save_to_brain(text_or_link: str) -> str:
     """Save something new into Arun's second brain. Only use when he asks you to save/remember something.
-    Give a YouTube, Instagram (reel/post), X (Twitter) or LinkedIn link (it will be watched/read and summarised),
+    Give a YouTube, Instagram (reel/post), X (Twitter), LinkedIn or Reddit link (it will be watched/read and summarised),
     or plain text (saved as his note)."""
     topics = await asyncio.to_thread(db.topics)
     words = text_or_link.split()

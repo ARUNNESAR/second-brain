@@ -15,26 +15,33 @@ MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 EMBED_MODEL = "gemini-embedding-001"
 EMBED_DIM = 768
 
-# If the main model is busy or out of free quota, try the next one.
-FALLBACK_MODELS = [MODEL, "gemini-3.5-flash", "gemini-flash-lite-latest"]
+# The free plan allows ~20 requests a day PER MODEL, so we walk down this list when one is used up or busy.
+# Best models first, lighter ones last. Together: roughly 140 requests a day.
+FALLBACK_MODELS = [MODEL, "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
+                   "gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
 
 _client = None
+_used_up = {}  # model -> time until which we skip it (its daily free quota ran out)
 
 
 def client():
     global _client
     if _client is None:
         # Without a timeout a stuck request can hang forever; 4 min is enough for a 1-hour video.
+        # Only retry "busy" errors here; a used-up quota (429) should move to the next model at once.
         _client = genai.Client(
             api_key=os.environ["GEMINI_API_KEY"].strip(),
-            http_options=types.HttpOptions(timeout=240_000, retry_options=types.HttpRetryOptions(attempts=2)),
+            http_options=types.HttpOptions(timeout=240_000, retry_options=types.HttpRetryOptions(
+                attempts=2, http_status_codes=[500, 502, 503, 504])),
         )
     return _client
 
 
 def _generate(contents, config):
     last = None
-    for attempt, model in enumerate(dict.fromkeys(FALLBACK_MODELS)):
+    for model in dict.fromkeys(FALLBACK_MODELS):
+        if _used_up.get(model, 0) > time.time():
+            continue
         try:
             return client().models.generate_content(model=model, contents=contents, config=config)
         except Exception as e:  # busy (503), quota (429) or model gone (404): move on
@@ -43,8 +50,11 @@ def _generate(contents, config):
                                               "DEADLINE", "imeout")):
                 raise
             last = e
-            time.sleep(2 * (attempt + 1))
-    raise last
+            if "429" in s or "404" in s:
+                _used_up[model] = time.time() + 60 * 60  # check it again in an hour
+            else:
+                time.sleep(2)
+    raise last or RuntimeError("RESOURCE_EXHAUSTED: all free Gemini models are used up for today")
 
 
 class Note(BaseModel):
@@ -168,7 +178,7 @@ def _upload(path, mime):
 
 def note_from_post(post, topics, caption=""):
     """post is a social.Post (Instagram reel/post or X post) with text and downloaded media."""
-    where = {"instagram": "Instagram reel/post", "x": "X (Twitter) post", "linkedin": "LinkedIn post"}[post.kind]
+    where = {"instagram": "Instagram reel/post", "x": "X (Twitter) post", "linkedin": "LinkedIn post", "reddit": "Reddit post (with its top comments)"}[post.kind]
     intro = f"{where} by {post.author or 'unknown'}.\nPost text / caption:\n{post.text or '(none)'}"
     if caption:
         intro += f"\n\nArun's own comment when saving: {caption}"
@@ -194,6 +204,15 @@ def note_from_post(post, topics, caption=""):
                 client().files.delete(name=f.name)
             except Exception:
                 pass
+
+
+def read_url(url, what):
+    """Gemini opens a web page from Google's side and copies `what` word for word."""
+    resp = _generate(
+        contents=f"Open this page: {url}\nCopy, word for word: {what}. Do not summarise. "
+                 f"If you cannot open the page or it doesn't exist, reply exactly CANNOT_OPEN.",
+        config=types.GenerateContentConfig(tools=[types.Tool(url_context=types.UrlContext())]))
+    return (resp.text or "").strip()
 
 
 # ---------- Plain notes ----------

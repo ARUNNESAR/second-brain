@@ -41,7 +41,7 @@ MAX_MSG = 4000
 
 HELP = """Your Second Brain 🧠
 
-SAVE: share a YouTube video, Instagram reel, X post or LinkedIn post, or send a screenshot. Add a comment with it if you like.
+SAVE: share a YouTube video, Instagram reel, or an X, LinkedIn or Reddit post, or send a screenshot. Add a comment with it if you like.
 NOTE: /note <text> saves your own thought.
 ASK: just type a question, e.g. "how do I handle price objections?"
 
@@ -145,7 +145,7 @@ async def save_link(update, url, caption):
         # Other sites (Reddit, articles…) can't be read yet. Keep the link so it can be processed later.
         save_id = await asyncio.to_thread(db.add, "link", url, url, None, None, None, caption, None, "pending")
         await update.message.reply_text(
-            f"📌 Kept the link as #{save_id}.\nI can read YouTube, Instagram, X and LinkedIn links and screenshots. "
+            f"📌 Kept the link as #{save_id}.\nI can read YouTube, Instagram, X, LinkedIn and Reddit links and screenshots. "
             f"For this site, send a screenshot and I'll save what it says.")
         return
     await _save_url(update, url, social.clean_url(url), kind, caption, "reel" if kind == "instagram" else "post")
@@ -214,7 +214,7 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("Nothing saved yet.")
         return
-    icons = {"youtube": "▶️", "image": "🖼", "note": "📝", "link": "🔗", "instagram": "📸", "x": "𝕏", "linkedin": "💼"}
+    icons = {"youtube": "▶️", "image": "🖼", "note": "📝", "link": "🔗", "instagram": "📸", "x": "𝕏", "linkedin": "💼", "reddit": "👽"}
     lines = [f"#{i} {icons.get(t, '•')} {title or '(untitled)'}"
              + (f" · {topic}" if topic else "") + (" (not read yet)" if st == "pending" else "")
              + f" · {created:%d %b}"

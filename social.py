@@ -20,6 +20,7 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 
 INSTAGRAM_RE = re.compile(r"instagram\.com/(?:[\w.]+/)?(reels?|p|tv)/([\w-]+)", re.I)
 LINKEDIN_RE = re.compile(r"(?:linkedin\.com/(?:posts|pulse|feed/update|embed/feed/update)/|lnkd\.in/)[^\s?#]+", re.I)
+REDDIT_RE = re.compile(r"(?:reddit\.com/r/\w+/(?:comments|s)/\w+|reddit\.com/comments/\w+|redd\.it/\w+)", re.I)
 X_RE = re.compile(r"(?:twitter|x|fxtwitter|vxtwitter|fixupx)\.com/(\w+)/status(?:es)?/(\d+)", re.I)
 
 
@@ -30,7 +31,7 @@ class Blocked(RuntimeError):
 @dataclass
 class Post:
     url: str                       # clean link we store
-    kind: str                      # instagram | x | linkedin
+    kind: str                      # instagram | x | linkedin | reddit
     author: str = ""
     text: str = ""
     media: list = field(default_factory=list)   # [(path, mime)]
@@ -49,6 +50,8 @@ def kind_of(url):
         return "x"
     if LINKEDIN_RE.search(url):
         return "linkedin"
+    if REDDIT_RE.search(url):
+        return "reddit"
     return None
 
 
@@ -63,6 +66,9 @@ def clean_url(url):
     m = LINKEDIN_RE.search(url)
     if m:
         return "https://www." + m.group(0) if m.group(0).lower().startswith("linkedin") else "https://" + m.group(0)
+    m = REDDIT_RE.search(url)
+    if m:
+        return ("https://" if m.group(0).startswith("redd.it") else "https://www.") + m.group(0) + ("/" if "/comments/" in m.group(0) else "")
     return url
 
 
@@ -238,8 +244,116 @@ def fetch_linkedin(url):
     return post
 
 
+# ---------- Reddit ----------
+
+REDDIT_UA = "SecondBrainBot/1.0 (personal notes app)"  # Reddit asks for a descriptive user agent
+
+
+def _reddit_json(path):
+    last = None
+    for host in ("www.reddit.com", "old.reddit.com"):
+        try:
+            req = urllib.request.Request(f"https://{host}{path}", headers={"User-Agent": REDDIT_UA})
+            return json.load(urllib.request.urlopen(req, timeout=30))
+        except Exception as e:
+            last = e
+    raise last
+
+
+def _reddit_rss(url):
+    """Post + top comments from Reddit's RSS feed (often still open when the JSON API is blocked)."""
+    try:
+        req = urllib.request.Request(url.rstrip("/") + "/.rss?sort=top&limit=12", headers={"User-Agent": REDDIT_UA})
+        feed = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "ignore")
+    except Exception:
+        return ""
+    out = []
+    for i, e in enumerate(re.findall(r"<entry>(.*?)</entry>", feed, re.S)):
+        author = re.search(r"<name>(.*?)</name>", e)
+        title = re.search(r"<title>(.*?)</title>", e)
+        body = re.search(r'<content type="html">(.*?)</content>', e, re.S)
+        text = html.unescape(re.sub(r"<[^>]+>", " ", html.unescape(body.group(1)))) if body else ""
+        text = " ".join(text.replace("[link] [comments]", "").split())
+        if i == 0:
+            out.append(f"{html.unescape(title.group(1)) if title else ''}\n\n{text}")
+        elif text:
+            out.append(f"- Comment by {author.group(1) if author else '?'}: {text[:1500]}")
+    if len(out) > 1:
+        out.insert(1, "Top comments:")
+    return "\n".join(out).strip()
+
+
+def _reddit_via_gemini(url):
+    """Last resort: Gemini opens the page itself (Google's fetcher is rarely blocked by Reddit)."""
+    import brain
+    try:
+        text = brain.read_url(url, "the post title, the post body, and the top 8 comments with their upvote counts")
+        return "" if "CANNOT_OPEN" in text else text
+    except Exception:
+        return ""
+
+
+def fetch_reddit(url):
+    post = Post(url=clean_url(url), kind="reddit", workdir=_workdir())
+    try:
+        if "/s/" in url or "redd.it/" in url:  # share links redirect to the real post
+            req = urllib.request.Request(post.url, headers={"User-Agent": REDDIT_UA})
+            post.url = urllib.request.urlopen(req, timeout=30).geturl().split("?")[0]
+        pid = re.search(r"/comments/(\w+)", post.url).group(1)
+        data = _reddit_json(f"/comments/{pid}.json?limit=30&depth=1&sort=top&raw_json=1")
+    except Exception as e:
+        # Reddit often blocks its free API now. Backup routes: its RSS feed, then Gemini's own web reader.
+        post.text = _reddit_rss(post.url) or _reddit_via_gemini(post.url)
+        if post.text:
+            post.note = "read through a backup route, so no images/video"
+            return post
+        post.cleanup()
+        raise Blocked(f"Reddit is blocking my server right now ({str(e)[:60]}).")
+
+    p = data[0]["data"]["children"][0]["data"]
+    post.url = "https://www.reddit.com" + p["permalink"]
+    post.author = f'u/{p.get("author")} in r/{p.get("subreddit")}'
+    parts = [p.get("title", ""), p.get("selftext", "")]
+    if p.get("url") and "reddit.com" not in p["url"] and "redd.it" not in p["url"]:
+        parts.append(f"Linked page: {p['url']}")
+    comments = [c["data"] for c in data[1]["data"]["children"] if c["kind"] == "t1" and c["data"].get("body")]
+    top = sorted(comments, key=lambda c: c.get("score", 0), reverse=True)[:8]
+    if top:
+        parts.append("Top comments:\n" + "\n".join(f'- ({c.get("score", 0)} upvotes) {c["body"][:1500]}' for c in top))
+    post.text = "\n\n".join(x for x in parts if x).strip()
+
+    try:
+        video = ((p.get("secure_media") or {}).get("reddit_video") or {})
+        if video.get("fallback_url"):
+            v = _download(video["fallback_url"], os.path.join(post.workdir, "v.mp4"))
+            post.media.append((v, "video/mp4"))
+            base = video["fallback_url"].split("/DASH_")[0]
+            for name in ("DASH_AUDIO_128.mp4", "DASH_audio.mp4", "DASH_AUDIO_64.mp4"):  # Reddit keeps sound separate
+                try:
+                    post.media.append((_download(f"{base}/{name}", os.path.join(post.workdir, "a.mp4")), "audio/mp4"))
+                    break
+                except Exception:
+                    continue
+        images = []
+        if p.get("is_gallery"):
+            for m in (p.get("media_metadata") or {}).values():
+                if m.get("s", {}).get("u"):
+                    images.append(m["s"]["u"])
+        elif re.search(r"\.(jpe?g|png|webp)$", p.get("url", ""), re.I):
+            images.append(p["url"])
+        for i, u in enumerate(images[:4]):
+            post.media.append((_download(u, os.path.join(post.workdir, f"p{i}.jpg")), "image/jpeg"))
+    except Exception as e:
+        post.note = f"couldn't download the media ({str(e)[:60]})"
+    if not post.text and not post.media:
+        post.cleanup()
+        raise RuntimeError("That Reddit post looks empty or deleted. Send a screenshot instead.")
+    return post
+
+
 def fetch(url):
-    return {"instagram": fetch_instagram, "x": fetch_x, "linkedin": fetch_linkedin}[kind_of(url)](url)
+    return {"instagram": fetch_instagram, "x": fetch_x, "linkedin": fetch_linkedin,
+            "reddit": fetch_reddit}[kind_of(url)](url)
 
 
 def make_note(url, topics, caption=""):
