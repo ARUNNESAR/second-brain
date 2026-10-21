@@ -175,6 +175,31 @@ def note_text_for_search(note):
     return f"{note.title}\nTopic: {note.topic}\n{note.summary}\n" + "\n".join(note.key_points)
 
 
+RECAP_RULES = """You write Arun's Sunday recap of what he saved in his second brain this week.
+Goal: help him actually remember and use it. Plain, friendly English, like a friend texting. Plain text only (no markdown, no ** bold **, no tables); use emoji section markers and • bullets.
+Format:
+🧠 Your week: <N> saves
+📚 By topic: one line per topic: the topic, then the 1-2 most useful lessons in a few words each
+💡 Top 3 lessons: the three most useful, specific points from the whole week (keep numbers / exact steps)
+✅ Try this week: 3 small, concrete actions he can do, based on the saves
+{throwback_rule}
+Keep it under 250 words. No intro or sign-off."""
+
+
+def weekly_recap(rows, throwback=None):
+    def fmt(r):
+        _, created, stype, _, title, topic, summary, points = r
+        return f"- {title} ({topic}, {stype}, {created:%a}): {summary} Points: " + "; ".join(points or [])
+    rule = ("🔁 From your past: one line reminding him of this older save and why it still matters."
+            if throwback else "")
+    text = "This week's saves:\n" + "\n".join(fmt(r) for r in rows)
+    if throwback:
+        text += f"\n\nOlder save to bring back (saved {throwback[1]:%d %b}):\n" + fmt(throwback)
+    resp = _generate(contents=text, config=types.GenerateContentConfig(
+        system_instruction=RECAP_RULES.format(throwback_rule=rule)))
+    return resp.text.strip()
+
+
 ANSWER_RULES = """You are Arun's second brain. Answer his question using ONLY the saved notes below.
 - Plain, friendly English. Short: get to the useful advice fast. Use bullet points for steps.
 - After each fact, cite the note number like [1] or [2].

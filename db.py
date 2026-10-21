@@ -94,6 +94,24 @@ def get(save_id):
                from saves where id = %s""", (save_id,)).fetchone()
 
 
+def since(days):
+    """Saves from the last N days (for the weekly recap)."""
+    with _connect() as c:
+        return c.execute(
+            """select id, created_at, source_type, source_url, title, topic, summary, key_points
+               from saves where status = 'done' and created_at > now() - make_interval(days => %s)
+               order by created_at""", (days,)).fetchall()
+
+
+def random_older(days):
+    """One random save older than N days, to bring back an old lesson before it's forgotten."""
+    with _connect() as c:
+        return c.execute(
+            """select id, created_at, source_type, source_url, title, topic, summary, key_points
+               from saves where status = 'done' and created_at <= now() - make_interval(days => %s)
+               order by random() limit 1""", (days,)).fetchone()
+
+
 def recent(limit=10):
     with _connect() as c:
         return c.execute(

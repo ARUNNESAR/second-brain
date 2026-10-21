@@ -47,7 +47,8 @@ ASK: just type a question, e.g. "how do I handle price objections?"
 /recent  last 10 saves
 /export  download everything as a file
 /delete <number>  remove a save
-/retry  try again on saves that failed to read"""
+/retry  try again on saves that failed to read
+/recap  recap of the last 7 days (it also comes by itself every Sunday 9 AM)"""
 
 
 def _short(text, limit=MAX_MSG):
@@ -242,6 +243,38 @@ async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await status.edit_text(f"Retry finished: {done} saved" + (f", {failed} still failing" if failed else "") + ".")
 
 
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+async def build_recap():
+    rows = await asyncio.to_thread(db.since, 7)
+    throwback = await asyncio.to_thread(db.random_older, 7)
+    if not rows:
+        msg = "🧠 Sunday recap: you didn't save anything this week. Share one useful video today 🙂"
+        if throwback:
+            msg += f"\n\n🔁 From your past: #{throwback[0]} {throwback[4]}\n{throwback[6]}"
+        return msg
+    return await asyncio.to_thread(brain.weekly_recap, rows, throwback)
+
+
+async def weekly_recap(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = await build_recap()
+        await context.bot.send_message(OWNER, _short(text), disable_web_page_preview=True)
+        log.info("weekly recap sent")
+    except Exception:
+        log.exception("weekly recap failed")
+
+
+async def cmd_recap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text("⏳ Making your recap of the last 7 days…")
+    try:
+        await status.edit_text(_short(await build_recap()), disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("recap failed")
+        await status.edit_text(_friendly_error(e))
+
+
 async def ignore_strangers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user:
         log.warning("Ignored message from non-owner %s", update.effective_user.id)
@@ -263,6 +296,7 @@ async def set_menu(app):
         ("note", "Save your own note"),
         ("export", "Download everything"),
         ("delete", "Remove a save, e.g. /delete 12"),
+        ("recap", "Recap of the last 7 days"),
         ("retry", "Retry saves that failed"),
         ("help", "How to use me"),
     ])
@@ -280,12 +314,15 @@ def build_app():
     app.add_handler(CommandHandler("export", cmd_export, filters=me))
     app.add_handler(CommandHandler("delete", cmd_delete, filters=me))
     app.add_handler(CommandHandler("retry", cmd_retry, filters=me))
+    app.add_handler(CommandHandler("recap", cmd_recap, filters=me))
     app.add_handler(MessageHandler(me & (filters.PHOTO | filters.Document.IMAGE), on_image))
     app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(~me, ignore_strangers))
 
     app.job_queue.run_daily(daily_ping, time=dt.time(hour=3, minute=0))
     app.job_queue.run_once(daily_ping, when=5)
+    # Every Sunday 9:00 AM India time (0 = Sunday)
+    app.job_queue.run_daily(weekly_recap, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(0,))
     return app
 
 
