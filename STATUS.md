@@ -11,7 +11,8 @@ ChatGPT / Claude (MCP)      ┼→ Render server (second-brain-xbgr.onrender.com
 
 | You want to… | Do this |
 |---|---|
-| Save a YouTube video or Short | Share it to **@arun_brain_bot** in Telegram |
+| Save a YouTube video, Instagram reel, X post or LinkedIn post | Share it to **@arun_brain_bot** in Telegram |
+| A note got something wrong | `/fix 12 the correct thing` |
 | Save a screenshot | Send the image to the bot |
 | Save your own thought | `/note …` in the bot |
 | Ask in Telegram | Type your question to the bot (Gemini answers) |
@@ -36,5 +37,5 @@ The PC does **not** need to be on anymore. **Don't run `start-bot.bat`.** It's o
 Use Settings → Connectors (or Plugins) → add a custom MCP server → paste the address from `MY-CONNECTOR-ADDRESS.txt` → Authentication: none. Nothing else needs rebuilding.
 
 ## NEXT (ideas)
-1. Instagram reels, X and Reddit links
-3. Personal Claude account → add the same connector
+1. Reddit links
+2. Personal Claude account → add the same connector
