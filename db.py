@@ -283,6 +283,13 @@ def set_embedding(save_id, embedding):
         c.execute("update saves set embedding = %s where id = %s", (_vec(embedding), save_id))
 
 
+def all_for_backup():
+    with _connect() as c:
+        return c.execute(
+            """select id, created_at, source_type, source_url, title, topic, summary, key_points, content, status,
+                      embedding from saves order by id""").fetchall()
+
+
 def delete(save_id):
     with _connect() as c:
         return c.execute("delete from saves where id = %s returning title", (save_id,)).fetchone()

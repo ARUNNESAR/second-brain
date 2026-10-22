@@ -4,3 +4,4 @@ logs/
 __pycache__/
 MY-CONNECTOR-ADDRESS.txt
 tmp/
+backups/

@@ -21,6 +21,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update  # noqa:
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,  # noqa: E402
                           MessageHandler, filters)
 
+import backup  # noqa: E402
 import brain  # noqa: E402
 import db  # noqa: E402
 import social  # noqa: E402
@@ -625,6 +626,44 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"🗑 Deleted #{save_id}" + (f": {gone[0]}" if gone else " (it was already gone)"))
 
 
+async def daily_backup(context: ContextTypes.DEFAULT_TYPE):
+    """2:30 AM: copy every save to the private GitHub backup repo. Tells Arun only if it fails."""
+    try:
+        n = await asyncio.to_thread(backup.to_github)
+        log.info("daily backup: %s", "not set up" if n is None else f"{n} saves")
+    except Exception as e:
+        log.exception("daily backup failed")
+        await context.bot.send_message(OWNER, f"⚠️ Last night's backup to GitHub failed: {str(e)[:150]}\n"
+                                              f"Send /backup to try again. (If it says 401, the GitHub token expired.)")
+
+
+async def weekly_backup_file(context: ContextTypes.DEFAULT_TYPE):
+    """Sunday: send the backup file in this chat too, silently, as a second copy in a different place."""
+    try:
+        content, n = await asyncio.to_thread(backup.make_file)
+        buf = io.BytesIO(content)
+        buf.name = f"second-brain-backup-{dt.datetime.now(IST):%Y-%m-%d}.json.gz"
+        await context.bot.send_document(OWNER, buf, caption=f"🗄 Weekly backup: {n} saves. Keep this file.",
+                                        disable_notification=True)
+    except Exception:
+        log.exception("weekly backup file failed")
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text("⏳ Backing up…")
+    try:
+        n = await asyncio.to_thread(backup.to_github)
+        content, total = await asyncio.to_thread(backup.make_file)
+        buf = io.BytesIO(content)
+        buf.name = f"second-brain-backup-{dt.datetime.now(IST):%Y-%m-%d}.json.gz"
+        await update.message.reply_document(buf, caption=f"🗄 Backup file: {total} saves.")
+        await status.edit_text(f"✅ Backed up {n} saves to GitHub." if n is not None else
+                               "✅ Backup file below. (GitHub backup isn't set up yet.)")
+    except Exception as e:
+        log.exception("manual backup failed")
+        await status.edit_text(f"❌ Backup failed: {str(e)[:200]}")
+
+
 async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = (context.args[0].lower() if context.args else "")
     if arg in ("on", "off"):
@@ -712,6 +751,7 @@ async def set_menu(app):
         ("recap", "Recap of the last 7 days"),
         ("retry", "Retry saves that failed"),
         ("reminders", "Turn daily reminders on/off"),
+        ("backup", "Back up all saves now"),
         ("help", "How to use me"),
     ])
 
@@ -733,6 +773,7 @@ def build_app():
     app.add_handler(CommandHandler("find", cmd_find, filters=me))
     app.add_handler(CommandHandler("topics", cmd_topics, filters=me))
     app.add_handler(CommandHandler("reminders", cmd_reminders, filters=me))
+    app.add_handler(CommandHandler("backup", cmd_backup, filters=me))
     app.add_handler(MessageHandler(me & (filters.VOICE | filters.AUDIO), on_voice))
     app.add_handler(MessageHandler(me & (filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO), on_video))
     app.add_handler(MessageHandler(me & filters.Document.PDF, on_pdf))
@@ -750,6 +791,8 @@ def build_app():
     # Daily reminder Mon-Sat 9:00 AM India time; Sunday 9:00 AM is the weekly recap instead (0 = Sunday)
     app.job_queue.run_daily(daily_tip, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(1, 2, 3, 4, 5, 6))
     app.job_queue.run_daily(weekly_recap, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(0,))
+    app.job_queue.run_daily(daily_backup, time=dt.time(hour=2, minute=30, tzinfo=IST))
+    app.job_queue.run_daily(weekly_backup_file, time=dt.time(hour=9, minute=5, tzinfo=IST), days=(0,))
     return app
 
 
