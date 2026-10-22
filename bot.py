@@ -630,7 +630,7 @@ async def daily_backup(context: ContextTypes.DEFAULT_TYPE):
     """2:30 AM: copy every save to the private GitHub backup repo. Tells Arun only if it fails."""
     try:
         n = await asyncio.to_thread(backup.to_github)
-        log.info("daily backup: %s", "not set up" if n is None else f"{n} saves")
+        log.info("daily backup: %s", "not set up" if n is None else f"{n[0]} new/changed, {n[1]} removed, {n[2]} total")
     except Exception as e:
         log.exception("daily backup failed")
         await context.bot.send_message(OWNER, f"⚠️ Last night's backup to GitHub failed: {str(e)[:150]}\n"
@@ -657,7 +657,7 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buf = io.BytesIO(content)
         buf.name = f"second-brain-backup-{dt.datetime.now(IST):%Y-%m-%d}.json.gz"
         await update.message.reply_document(buf, caption=f"🗄 Backup file: {total} saves.")
-        await status.edit_text(f"✅ Backed up {n} saves to GitHub." if n is not None else
+        await status.edit_text(f"✅ GitHub backup done: {n[0]} new/changed, {n[1]} removed, {n[2]} saves in total." if n is not None else
                                "✅ Backup file below. (GitHub backup isn't set up yet.)")
     except Exception as e:
         log.exception("manual backup failed")

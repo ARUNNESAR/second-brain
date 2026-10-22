@@ -2,6 +2,7 @@
 
     .venv\\Scripts\\python restore.py second-brain-backup-2026-10-23.json.gz          (shows what it would do)
     .venv\\Scripts\\python restore.py second-brain-backup-2026-10-23.json.gz --apply  (actually restores)
+    .venv\\Scripts\\python restore.py path\to\second-brain-backup\saves --apply       (from the GitHub backup folder)
 
 Only saves whose number (#id) is missing from the database are added; existing saves are never touched.
 """
@@ -18,7 +19,11 @@ import db  # noqa: E402
 
 
 def main(path, apply=False):
-    data = json.loads(gzip.decompress(open(path, "rb").read()))
+    if os.path.isdir(path):  # the GitHub backup: one JSON file per save
+        saves = [json.load(open(os.path.join(path, f), encoding="utf-8")) for f in sorted(os.listdir(path)) if f.endswith(".json")]
+        data = {"made_at": "GitHub backup folder", "count": len(saves), "saves": saves}
+    else:
+        data = json.loads(gzip.decompress(open(path, "rb").read()))
     db.setup()
     existing = {r[0] for r in db.all_saves()}
     missing = [s for s in data["saves"] if s["id"] not in existing]
