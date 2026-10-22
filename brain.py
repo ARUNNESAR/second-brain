@@ -237,6 +237,101 @@ def read_url(url, what):
     return (resp.text or "").strip()
 
 
+# ---------- On request: on-screen text, hidden resources, things Arun attaches ----------
+
+SCREEN_RULES = """Copy, WORD FOR WORD, every block of text shown on screen in this video that someone might want to
+reuse: prompts, code, commands, links/URLs, tool names, lists, settings, templates, slide text.
+- Keep the original line breaks. Put each block under a line like "[0:42] Prompt shown on screen:".
+- Skip subtitles that only repeat what is being spoken, logos, and watermarks.
+- If a word is unreadable write [unclear]. Never guess or invent text.
+- If there is no such text at all, reply exactly: NO_SCREEN_TEXT"""
+
+
+def screen_text_youtube(url):
+    """Read on-screen text of a YouTube video (Gemini watches it at normal, not low, resolution)."""
+    resp = _generate(contents=types.Content(parts=[types.Part(file_data=types.FileData(file_uri=url)),
+                                                   types.Part(text="Copy the on-screen text.")]),
+                     config=types.GenerateContentConfig(system_instruction=SCREEN_RULES,
+                                                        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM))
+    return (resp.text or "").strip()
+
+
+def screen_text_post(post):
+    """Read on-screen text from a downloaded post (social.Post): its video and images."""
+    parts, uploaded = [], []
+    try:
+        for path, mime in post.media:
+            if mime.startswith("image/"):
+                with open(path, "rb") as fh:
+                    parts.append(types.Part.from_bytes(data=fh.read(), mime_type=mime))
+            elif mime.startswith("video/"):
+                f = _upload(path, mime)
+                uploaded.append(f)
+                parts.append(types.Part(file_data=types.FileData(file_uri=f.uri, mime_type=mime)))
+        if not parts:
+            return "NO_SCREEN_TEXT"
+        resp = _generate(contents=parts + ["Copy the on-screen text."],
+                         config=types.GenerateContentConfig(system_instruction=SCREEN_RULES))
+        return (resp.text or "").strip()
+    finally:
+        for f in uploaded:
+            _delete_upload(f)
+
+
+class Offer(BaseModel):
+    has_offer: bool          # does the creator offer something extra (prompt, template, link, guide…)?
+    how_to_get: str          # e.g. "Comment PROMPT and they DM it", "Link in bio", "" if none
+    what: str                # what the resource is, e.g. "the full ChatGPT prompt for cold emails"
+    urls: list[str]          # any URLs already written in the post text / transcript
+
+
+def find_offer(title, author, text):
+    """Spot 'comment X and I'll DM you…' style offers in a save's text."""
+    resp = _generate(
+        contents=f"Title: {title}\nCreator: {author or 'unknown'}\n\nText of the post / video:\n{text[:20000]}",
+        config=types.GenerateContentConfig(
+            system_instruction="Does the creator offer an extra resource (a prompt, template, guide, website, link, "
+                               "file) that viewers get by commenting a word, DMing, following a link in bio, or a link "
+                               "in the text? Only report what is actually stated. Use empty strings/lists when none.",
+            response_mime_type="application/json", response_schema=Offer))
+    return resp.parsed if resp.parsed else Offer(**json.loads(resp.text or "{}"))
+
+
+def search_resource(what, author):
+    """Try to find the offered resource publicly on the web (Google Search through Gemini). '' if not found."""
+    try:
+        resp = _generate(
+            contents=f"Find where this is publicly available online: {what}" + (f" (by {author})" if author else "") +
+                     ". Reply with the best 1-3 URLs and one line each on what they are. "
+                     "If you can't find it with confidence, reply exactly NOT_FOUND.",
+            config=types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]))
+        text = (resp.text or "").strip()
+        return "" if not text or "NOT_FOUND" in text else text
+    except Exception:
+        return ""  # search not available on the free plan / quota: fall back to the to-get list
+
+
+def read_attachment(text_or_url):
+    """What Arun attached to a save (DM text or a link). For a plain web link, read the page itself."""
+    url = re.search(r"https?://\S+", text_or_url or "")
+    if url and len(text_or_url.strip()) < len(url.group(0)) + 40:  # basically just a link
+        try:
+            page = read_url(url.group(0), "the main content of the page (the prompt / template / guide / text)")
+            if page and "CANNOT_OPEN" not in page:
+                return f"{text_or_url.strip()}\n\n{page}"
+        except Exception:
+            pass  # Gemini busy / out of free quota: keep the link itself, never lose what Arun sent
+    return text_or_url.strip()
+
+
+def image_text(image_bytes, mime):
+    """All text in a screenshot, word for word (for screenshots attached to an existing save)."""
+    resp = _generate(contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime),
+                               "Copy all the text in this image, word for word. Keep line breaks."],
+                     config=types.GenerateContentConfig())
+    return (resp.text or "").strip()
+
+
 # ---------- Plain notes ----------
 
 def note_from_text(text, topics):

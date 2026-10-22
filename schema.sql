@@ -25,3 +25,13 @@ alter table saves add column if not exists last_shown timestamptz;
 
 -- Small settings (e.g. reminders on/off)
 create table if not exists settings (key text primary key, value text);
+
+-- Resources still to get ("comment X and I'll DM you…")
+create table if not exists toget (
+    id         bigserial primary key,
+    save_id    bigint references saves(id) on delete cascade,
+    what       text,
+    how        text,
+    done       boolean not null default false,
+    created_at timestamptz not null default now()
+);

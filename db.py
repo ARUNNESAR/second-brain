@@ -283,6 +283,35 @@ def set_embedding(save_id, embedding):
         c.execute("update saves set embedding = %s where id = %s", (_vec(embedding), save_id))
 
 
+def append_extra(save_id, label, text, point=None):
+    """Add a section (screen text, resource, attachment) to a save. Returns the updated row for re-embedding."""
+    with _connect() as c:
+        return c.execute(
+            """update saves set content = coalesce(content, '') || %s,
+                      key_points = case when %s::text is null then key_points
+                                        else array_append(coalesce(key_points, '{}'), %s::text) end
+               where id = %s returning id, title, topic, summary, key_points, content, source_type, source_url""",
+            (f"\n\n--- {label} ---\n{text}", point, point, save_id)).fetchone()
+
+
+def add_toget(save_id, what, how):
+    with _connect() as c:
+        if not c.execute("select 1 from toget where save_id = %s and not done", (save_id,)).fetchone():
+            c.execute("insert into toget (save_id, what, how) values (%s, %s, %s)", (save_id, what, how))
+
+
+def open_toget():
+    with _connect() as c:
+        return c.execute(
+            """select t.id, t.save_id, t.what, t.how, s.title from toget t join saves s on s.id = t.save_id
+               where not t.done order by t.created_at""").fetchall()
+
+
+def finish_toget(save_id):
+    with _connect() as c:
+        return c.execute("update toget set done = true where save_id = %s and not done", (save_id,)).rowcount
+
+
 def all_for_backup():
     with _connect() as c:
         return c.execute(

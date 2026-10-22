@@ -57,7 +57,8 @@ ASK: just type a question, e.g. "how do I handle price objections?"
 /recap  recap of the last 7 days (it also comes by itself every Sunday 9 AM)
 
 Every other morning at 9 AM you get one old save to remember (/reminders off to pause).
-Reply to any "✅ Saved #12" message with a question to ask about that save only."""
+Reply to any "✅ Saved #12" message with a question to ask about that save only, or with a link / forwarded DM / screenshot to ADD it to that save.
+On videos: tap 📝 Screen text (copies prompts shown on screen) or 🎁 Get resource (finds "comment X and I'll DM you" links). Or type full with the link to do both. /toget lists what you still need to collect."""
 
 
 def _short(text, limit=MAX_MSG):
@@ -75,13 +76,21 @@ def _friendly_error(e):
     return f"Something went wrong: {s[:200]}"
 
 
-def _saved_reply(save_id, note, prefix="✅ Saved"):
-    """Short confirmation + a Details button (the full note only when Arun taps it)."""
+VIDEO_KINDS = {"youtube", "instagram", "x", "linkedin", "reddit"}  # links we can open again for extras
+
+
+def _saved_reply(save_id, note, prefix="✅ Saved", kind=None):
+    """Short confirmation + buttons. Video/post links also get the optional 📝 Screen text and 🎁 Get resource."""
     text = f"{prefix} #{save_id} · {note.topic}\n{note.title}"
     dup = _similar.pop(save_id, None)
     if dup:
         text += f"\n\n⚠️ Looks like you already saved this: #{dup[0]} {dup[1]}\nTap 🗑 to remove this new copy."
-    return text, _details_button(save_id)
+    markup = _details_button(save_id)
+    if kind in VIDEO_KINDS:
+        markup = InlineKeyboardMarkup(list(markup.inline_keyboard) + [[
+            InlineKeyboardButton("📝 Screen text", callback_data=f"st:{save_id}"),
+            InlineKeyboardButton("🎁 Get resource", callback_data=f"rs:{save_id}")]])
+    return text, markup
 
 
 def _details_button(save_id):
@@ -135,6 +144,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     text = msg.text.strip()
     urls = list(dict.fromkeys(URL_RE.findall(text)))
+    replied = msg.reply_to_message
+    if replied and replied.from_user and replied.from_user.is_bot:
+        m = SCOPED_RE.match(replied.text or "")
+        if m:  # a reply to one of the bot's messages about ONE save
+            save_id = int(m.group(1))
+            if urls or msg.forward_origin or text.lower().startswith("add"):
+                await attach_to(msg, save_id, text=re.sub(r"^add:?\s*", "", text, flags=re.I))  # DM link / text
+            else:
+                await ask(update, text, only_id=save_id)  # a question about that save
+            return
     if urls:  # every link in the message gets saved, not just the first
         caption = URL_RE.sub("", text).strip()
         for u in urls:
@@ -143,12 +162,6 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await save_link(update, context, u, caption)
         return
-    replied = msg.reply_to_message
-    if replied and replied.from_user and replied.from_user.is_bot:
-        m = SCOPED_RE.match(replied.text or "")
-        if m:  # a reply to one of the bot's save messages = a question about THAT save
-            await ask(update, text, only_id=int(m.group(1)))
-            return
     if msg.forward_origin:  # forwarded from another chat: that's something to remember, not a question
         await save_text(msg, text)
     elif len(text) > 280 or text.count("\n") >= 3:  # long text: could be a tip to save or a long question
@@ -161,7 +174,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # bot messages that are about ONE save: replying to them asks about that save
-SCOPED_RE = re.compile(r"^(?:✅ Saved|🔁 Saved later|📥 Got it|💡 Remember this\?)? ?#(\d+)\b")
+SCOPED_RE = re.compile(r"^(?:✅ Saved|🔁 Saved later|📥 Got it|💡 Remember this\?|🎁|📝 On-screen text from|📎 Added to)? ?#(\d+)\b")
 
 _texts = {}  # message_id -> long text waiting for the Save/Ask choice
 
@@ -322,12 +335,19 @@ async def process_queue(context: ContextTypes.DEFAULT_TYPE):
             else:
                 # Saved. A problem telling Arun must not undo the save.
                 try:
-                    text, markup = _saved_reply(save_id, note)
+                    text, markup = _saved_reply(save_id, note, kind=kind)
                     if warning:
                         text += "\n(only the caption/text could be read)"
                     await _tell(context.bot, save_id, text, markup)
                 except Exception:
                     log.exception("queue: saved #%s but couldn't send the message", save_id)
+                if FULL_RE.search(caption or ""):  # Arun typed "full" with the link: do the extras right away
+                    for extra in (screen_text_for, resource_for):
+                        try:
+                            await context.bot.send_message(OWNER, _short(await extra(save_id)),
+                                                           disable_web_page_preview=True)
+                        except Exception:
+                            log.exception("full extras failed for #%s", save_id)
             if kind == "instagram":
                 await asyncio.sleep(40)  # space out reels so Instagram doesn't block the server
 
@@ -371,6 +391,14 @@ async def save_link(update, context, url, caption):
 
 async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    replied = msg.reply_to_message
+    m = SCOPED_RE.match(replied.text or "") if replied and replied.from_user and replied.from_user.is_bot else None
+    if m and not msg.media_group_id:  # a screenshot (e.g. of the DM) sent as a reply to a save: add it there
+        src = msg.photo[-1] if msg.photo else msg.document
+        if (src.file_size or 0) <= MAX_TG_FILE:
+            data = bytes(await (await src.get_file()).download_as_bytearray())
+            await attach_to(msg, int(m.group(1)), image=(data, "image/jpeg" if msg.photo else msg.document.mime_type))
+            return
     if msg.media_group_id:  # several screenshots sent together: wait a moment, then save them as ONE note
         group = _albums.setdefault(msg.media_group_id, [])
         group.append(msg)
@@ -626,6 +654,119 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"🗑 Deleted #{save_id}" + (f": {gone[0]}" if gone else " (it was already gone)"))
 
 
+# ---------- on-request extras: on-screen text, hidden resources, attachments ----------
+
+FULL_RE = re.compile(r"\bfull\b", re.I)  # "full" typed with a link = do the extras automatically
+
+
+async def _reembed(row):
+    """After adding text to a save, refresh its search vector so the new text is findable."""
+    save_id, title, topic, summary, points, content = row[:6]
+    extra = (content or "").split("\n\n--- ", 1)[1][:3000] if "\n\n--- " in (content or "") else ""
+    vec = await asyncio.to_thread(brain.embed, f"{title}\nTopic: {topic}\n{summary}\n" + "\n".join(points or []) + "\n" + extra)
+    await asyncio.to_thread(db.set_embedding, save_id, vec)
+
+
+async def screen_text_for(save_id):
+    """Re-open a saved video/post and keep every on-screen text block word for word. Returns a message."""
+    row = await asyncio.to_thread(db.get, save_id)
+    if not row:
+        return f"#{save_id} doesn't exist anymore."
+    stype, url = row[2], row[3]
+    if stype == "youtube":
+        text = await asyncio.to_thread(brain.screen_text_youtube, url)
+    elif stype in VIDEO_KINDS and url:
+        post = await asyncio.to_thread(social.fetch, url)
+        try:
+            text = await asyncio.to_thread(brain.screen_text_post, post)
+        finally:
+            post.cleanup()
+    else:
+        return "I can only do this for YouTube, Instagram, X, LinkedIn and Reddit links."
+    if not text or "NO_SCREEN_TEXT" in text:
+        return f"📝 #{save_id}: no prompts or text blocks on screen in this one."
+    updated = await asyncio.to_thread(db.append_extra, save_id, "On-screen text", text,
+                                      "📝 On-screen text saved: " + " ".join(text.split())[:120])
+    await _reembed(updated)
+    return f"📝 On-screen text from #{save_id} (saved into the note):\n\n{text}"
+
+
+async def resource_for(save_id):
+    """Find the 'comment X and I'll DM you…' resource: links in the post, a web search, or the to-get list."""
+    row = await asyncio.to_thread(db.get, save_id)
+    if not row:
+        return f"#{save_id} doesn't exist anymore."
+    _, _, stype, url, title, _, summary, points, content = row
+    offer = await asyncio.to_thread(brain.find_offer, title, "", f"{summary}\n" + "\n".join(points or []) + f"\n{content or ''}")
+    if not offer.has_offer and not offer.urls:
+        return f"🎁 #{save_id}: this one doesn't offer an extra resource."
+    lines = [f"🎁 #{save_id} offers: {offer.what or 'a resource'}" + (f"\nHow to get it: {offer.how_to_get}" if offer.how_to_get else "")]
+    found = "\n".join(offer.urls)
+    if not found:
+        found = await asyncio.to_thread(brain.search_resource, offer.what, "")
+    if found:
+        updated = await asyncio.to_thread(db.append_extra, save_id, "Resource (found online, please check)", found,
+                                          "🎁 Resource link saved (see Details)")
+        await _reembed(updated)
+        lines.append(f"\nFound this (check it's the right one):\n{found}")
+    if offer.how_to_get and not found:
+        await asyncio.to_thread(db.add_toget, save_id, offer.what, offer.how_to_get)
+        lines.append("\nCouldn't find it online, so it's on your /toget list.\n"
+                     f"When you get it, reply to this message with the link, text or screenshot and I'll add it to #{save_id}.")
+    return "\n".join(lines)
+
+
+async def on_extra_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """📝 Screen text (st:<id>) and 🎁 Get resource (rs:<id>) buttons."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    action, sid = q.data.split(":")
+    save_id = int(sid)
+    label = "on-screen text" if action == "st" else "resource"
+    status = await q.message.reply_text(f"⏳ Looking for the {label} in #{save_id}… (up to a minute)")
+    try:
+        text = await (screen_text_for(save_id) if action == "st" else resource_for(save_id))
+        await status.edit_text(_short(text), disable_web_page_preview=True)
+    except Exception as e:
+        log.exception("%s failed for #%s", label, save_id)
+        await status.edit_text(_friendly_error(e))
+
+
+async def attach_to(reply_to, save_id, text=None, image=None):
+    """Arun replied to a save with a link / forwarded DM / screenshot: add it to that save."""
+    status = await reply_to.reply_text(f"⏳ Adding it to #{save_id}…")
+    try:
+        if image:
+            data, mime = image
+            text = await asyncio.to_thread(brain.image_text, data, mime)
+        else:
+            text = await asyncio.to_thread(brain.read_attachment, text)
+        updated = await asyncio.to_thread(db.append_extra, save_id, "Added by Arun", text,
+                                          "📎 Added: " + " ".join(text.split())[:120])
+        if not updated:
+            await status.edit_text(f"#{save_id} doesn't exist anymore.")
+            return
+        await _reembed(updated)
+        done = await asyncio.to_thread(db.finish_toget, save_id)
+        await status.edit_text(f"📎 Added to #{save_id}: {updated[1]}" + ("\n✅ Ticked off your /toget list." if done else ""))
+    except Exception as e:
+        log.exception("attach failed for #%s", save_id)
+        await status.edit_text(_friendly_error(e))
+
+
+async def cmd_toget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = await asyncio.to_thread(db.open_toget)
+    if not rows:
+        await update.message.reply_text("🎁 Nothing on your to-get list. 👍")
+        return
+    lines = [f"#{sid} {what or title}\n   ↳ {how}" for _, sid, what, how, title in rows]
+    await update.message.reply_text(
+        _short("🎁 Still to get (reply to a save with what you receive):\n\n" + "\n".join(lines)),
+        reply_markup=_list_markup([(sid, title) for _, sid, _, _, title in rows[:10]]))
+
+
 async def daily_backup(context: ContextTypes.DEFAULT_TYPE):
     """2:30 AM: copy every save to the private GitHub backup repo. Tells Arun only if it fails."""
     try:
@@ -752,6 +893,7 @@ async def set_menu(app):
         ("retry", "Retry saves that failed"),
         ("reminders", "Turn daily reminders on/off"),
         ("backup", "Back up all saves now"),
+        ("toget", "Resources still to get (comment-for-link)"),
         ("help", "How to use me"),
     ])
 
@@ -774,6 +916,8 @@ def build_app():
     app.add_handler(CommandHandler("topics", cmd_topics, filters=me))
     app.add_handler(CommandHandler("reminders", cmd_reminders, filters=me))
     app.add_handler(CommandHandler("backup", cmd_backup, filters=me))
+    app.add_handler(CommandHandler("toget", cmd_toget, filters=me))
+    app.add_handler(CallbackQueryHandler(on_extra_button, pattern=r"^(st|rs):\d+$"))
     app.add_handler(MessageHandler(me & (filters.VOICE | filters.AUDIO), on_voice))
     app.add_handler(MessageHandler(me & (filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO), on_video))
     app.add_handler(MessageHandler(me & filters.Document.PDF, on_pdf))

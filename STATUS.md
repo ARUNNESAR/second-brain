@@ -12,6 +12,8 @@ ChatGPT / Claude (MCP)      ┼→ Render server (second-brain-xbgr.onrender.com
 | You want to… | Do this |
 |---|---|
 | Save a YouTube video, Instagram reel, X post or LinkedIn post | Share it to **@arun_brain_bot** in Telegram |
+| Copy prompts/text shown in a video | Tap 📝 Screen text on the save (or type `full` with the link) |
+| Get a "comment X and I'll DM you" resource | Tap 🎁 Get resource. When you get the DM, reply to the save with the link/screenshot. `/toget` = still to collect |
 | A note got something wrong | `/fix 12 the correct thing` |
 | Save screenshots / voice note / video file / PDF | Send it to the bot (several screenshots together = one note) |
 | Forwarded message | Forward it to the bot and it gets saved |
