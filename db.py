@@ -128,6 +128,65 @@ def all_saves():
         ).fetchall()
 
 
+# ---------- queue: links wait here (status 'pending') and are saved one by one in the background ----------
+
+QUEUE_TYPES = ("youtube", "instagram", "x", "linkedin", "reddit", "link")
+
+
+def next_queued():
+    """Oldest link that is due to be (re)tried."""
+    with _connect() as c:
+        return c.execute(
+            """select id, source_type, source_url, content from saves
+               where status = 'pending' and next_try <= now() and source_type = any(%s)
+               order by next_try, id limit 1""", (list(QUEUE_TYPES),)).fetchone()
+
+
+def postpone(save_id, minutes, max_attempts=6):
+    """Try again later; after max_attempts mark it failed. Returns the new status."""
+    with _connect() as c:
+        return c.execute(
+            """update saves set attempts = attempts + 1, next_try = now() + make_interval(mins => %s),
+                      status = case when attempts + 1 >= %s then 'failed' else 'pending' end
+               where id = %s returning status""", (minutes, max_attempts, save_id)).fetchone()[0]
+
+
+def retry_all():
+    """Put every pending/failed link back at the front of the queue."""
+    with _connect() as c:
+        return c.execute(
+            """update saves set status = 'pending', attempts = 0, next_try = now()
+               where status in ('pending', 'failed') and source_type = any(%s) returning id""",
+            (list(QUEUE_TYPES),)).rowcount
+
+
+def retry_one(save_id):
+    with _connect() as c:
+        c.execute("update saves set status = 'pending', attempts = 0, next_try = now() where id = %s", (save_id,))
+
+
+def set_status(save_id, status):
+    with _connect() as c:
+        c.execute("update saves set status = %s where id = %s", (status, save_id))
+
+
+def queue_size():
+    with _connect() as c:
+        return c.execute("select count(*) from saves where status = 'pending'").fetchone()[0]
+
+
+def pick_tip():
+    """One older save for the daily reminder: the one shown least recently (never shown first)."""
+    with _connect() as c:
+        row = c.execute(
+            """select id, created_at, source_type, source_url, title, topic, summary, key_points from saves
+               where status = 'done' and created_at < now() - interval '12 hours'
+               order by last_shown nulls first, random() limit 1""").fetchone()
+        if row:
+            c.execute("update saves set last_shown = now() where id = %s", (row[0],))
+        return row
+
+
 def add_correction(save_id, text):
     """Arun's correction becomes the first key point, so search and answers see it."""
     with _connect() as c:

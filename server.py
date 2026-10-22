@@ -89,7 +89,7 @@ async def recent_saves(limit: int = 10) -> str:
     if not rows:
         return "Nothing saved yet."
     return "\n".join(f"#{i} {title or '(untitled)'} | {topic or '-'} | {t} | {created:%d %b %Y}"
-                     + (" | not processed yet" if st == "pending" else "")
+                     + ("" if st == "done" else f" | {st}: not processed")
                      for i, created, t, title, topic, st in rows)
 
 

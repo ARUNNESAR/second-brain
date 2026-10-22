@@ -17,3 +17,8 @@ create table if not exists saves (
 
 create index if not exists saves_embedding_idx on saves using hnsw (embedding vector_cosine_ops);
 create index if not exists saves_created_idx on saves (created_at desc);
+
+-- Queue + daily tip (added Oct 2026)
+alter table saves add column if not exists attempts int not null default 0;
+alter table saves add column if not exists next_try timestamptz not null default now();
+alter table saves add column if not exists last_shown timestamptz;
