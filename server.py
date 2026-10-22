@@ -40,7 +40,9 @@ mcp = MCPServer(
         "This is Arun's personal knowledge base: notes he saved from YouTube videos, reels, posts, screenshots "
         "and his own thoughts. When he says 'second brain', 'my saves', 'my notes', or asks something he may have "
         "saved advice about, call search_my_brain first and base your answer on what it returns. Mention which "
-        "save each point came from (title + date). If nothing relevant is found, say so before giving general advice."
+        "save each point came from (title + date). If saves disagree with each other, show both sides with their dates "
+        "(say which is newer) instead of blending them or picking one. If nothing relevant is found, say so before "
+        "giving general advice."
     ),
 )
 

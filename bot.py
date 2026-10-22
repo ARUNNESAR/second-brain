@@ -77,7 +77,8 @@ def _saved_reply(save_id, note, prefix="✅ Saved"):
 
 
 def _details_button(save_id):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📖 Details", callback_data=f"d:{save_id}")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📖 Details", callback_data=f"d:{save_id}"),
+                                  InlineKeyboardButton("🗑 Delete", callback_data=f"x:{save_id}")]])
 
 
 def _details_text(row):
@@ -352,12 +353,33 @@ async def queue_tick(context: ContextTypes.DEFAULT_TYPE):
 async def on_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """The '📖 Details' button: show the full note under the short message."""
     q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
     await q.answer()
     row = await asyncio.to_thread(db.get, int(q.data.split(":")[1]))
     if row:
         await q.message.reply_text(_details_text(row), disable_web_page_preview=True)
     else:
         await q.message.reply_text("That save was deleted.")
+
+
+async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🗑 Delete button: x:<id> asks to confirm, xx:<id> deletes, k:<id> cancels."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    action, sid = q.data.split(":")
+    save_id = int(sid)
+    await q.answer()
+    if action == "x":
+        await q.edit_message_reply_markup(InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
+            InlineKeyboardButton("✖ Cancel", callback_data=f"k:{save_id}")]]))
+    elif action == "k":
+        await q.edit_message_reply_markup(_details_button(save_id))
+    else:
+        gone = await asyncio.to_thread(db.delete, save_id)
+        await q.edit_message_text(f"🗑 Deleted #{save_id}" + (f": {gone[0]}" if gone else " (it was already gone)"))
 
 
 async def daily_tip(context: ContextTypes.DEFAULT_TYPE):
@@ -452,6 +474,7 @@ def build_app():
     app.add_handler(MessageHandler(me & (filters.PHOTO | filters.Document.IMAGE), on_image))
     app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_details, pattern=r"^d:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^(x|xx|k):\d+$"))
     app.add_handler(MessageHandler(~me, ignore_strangers))
 
     app.job_queue.run_daily(daily_ping, time=dt.time(hour=3, minute=0))

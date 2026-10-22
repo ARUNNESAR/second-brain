@@ -274,6 +274,9 @@ ANSWER_RULES = """You are Arun's second brain. Answer his question using ONLY th
 - After each fact, cite the note number like [1] or [2].
 - If the notes don't answer the question, say so honestly in one line, then mention the closest thing he did save (if any).
 - Never invent advice that isn't in the notes.
+- If the notes DISAGREE with each other on his question, never blend them and never silently pick one. Start with
+  "Your saves disagree:" then give each side in one line with its citation and saved date, say which is newer,
+  and add the reason each side gives (if the notes give one). Let Arun decide.
 - Plain text only: no markdown headings, no ** bold **, no tables."""
 
 
@@ -281,7 +284,7 @@ def answer(question, rows):
     blocks = []
     for i, r in enumerate(rows, 1):
         _, created, stype, url, title, topic, summary, points, content, _ = r
-        body = f"[{i}] {title} ({stype}, saved {created:%d %b %Y}, topic: {topic})\nSummary: {summary}\nKey points:\n- " + "\n- ".join(points or [])
+        body = f"[{i}] {title} ({stype}, saved {created:%d %b %Y %H:%M}, topic: {topic})\nSummary: {summary}\nKey points:\n- " + "\n- ".join(points or [])
         if content:
             body += f"\nOriginal (excerpt): {content[:6000]}"
         blocks.append(body)
