@@ -84,11 +84,16 @@ def _note_config(topics, content_rule):
         system_instruction=NOTE_RULES.format(topics=", ".join(topics) or "none yet", content_rule=content_rule),
         response_mime_type="application/json",
         response_schema=Note,
+        max_output_tokens=60000,  # room for a full transcript of a long video inside the note
     )
 
 
 def _parse(resp):
-    return resp.parsed if resp.parsed else Note(**json.loads(resp.text))
+    if resp.parsed:
+        return resp.parsed
+    if not resp.text:  # blocked by a safety filter, or the answer came back empty
+        raise RuntimeError("Gemini returned an empty note for this item")
+    return Note(**json.loads(resp.text))
 
 
 # ---------- YouTube ----------
@@ -170,10 +175,19 @@ def _upload(path, mime):
         if f.state and f.state.name == "ACTIVE":
             return f
         if f.state and f.state.name == "FAILED":
+            _delete_upload(f)
             raise RuntimeError("Gemini couldn't process the video")
         time.sleep(2)
         f = client().files.get(name=f.name)
+    _delete_upload(f)
     raise RuntimeError("Gemini took too long to process the video")
+
+
+def _delete_upload(f):
+    try:
+        client().files.delete(name=f.name)
+    except Exception:
+        pass
 
 
 def note_from_post(post, topics, caption=""):
@@ -274,7 +288,7 @@ def weekly_recap(rows, throwback=None):
         text += f"\n\nOlder save to bring back (saved {throwback[1]:%d %b}):\n" + fmt(throwback)
     resp = _generate(contents=text, config=types.GenerateContentConfig(
         system_instruction=RECAP_RULES.format(throwback_rule=rule)))
-    return resp.text.strip()
+    return (resp.text or "").strip()
 
 
 ANSWER_RULES = """You are Arun's second brain. Answer his question using ONLY the saved notes below.
@@ -301,4 +315,4 @@ def answer(question, rows, history="", excerpt=6000):
     resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + prev + f"\n\nArun's question: {question}",
         config=types.GenerateContentConfig(system_instruction=ANSWER_RULES),
     )
-    return resp.text.strip()
+    return (resp.text or "").strip()

@@ -102,8 +102,15 @@ async def list_topics() -> str:
     return ", ".join(topics) if topics else "No topics yet."
 
 
-def _done(found):
-    return bool(found) and found[2] == "done"
+def _already(found):
+    """Message if this link is already saved or waiting in the Telegram bot's queue, else None."""
+    if not found:
+        return None
+    if found[2] == "done":
+        return f"Already saved as #{found[0]}: {found[1]}"
+    if found[2] == "pending":
+        return f"Already in the queue as #{found[0]}; it will be saved automatically."
+    return None
 
 
 @mcp.tool()
@@ -116,13 +123,15 @@ async def save_to_brain(text_or_link: str) -> str:
     yt = next((w for w in words if brain.youtube_id(w)), None)
     post = next((w for w in words if social.kind_of(w)), None)
     if yt:
-        if _done(await asyncio.to_thread(db.find_url, f"https://www.youtube.com/watch?v={brain.youtube_id(yt)}")):
-            return "That video is already saved."
+        msg = _already(await asyncio.to_thread(db.find_url, f"https://www.youtube.com/watch?v={brain.youtube_id(yt)}"))
+        if msg:
+            return msg
         note, link = await asyncio.to_thread(brain.note_from_youtube, yt, topics)
         stype = "youtube"
     elif post:
-        if _done(await asyncio.to_thread(db.find_url, social.clean_url(post))):
-            return "That post is already saved."
+        msg = _already(await asyncio.to_thread(db.find_url, social.clean_url(post)))
+        if msg:
+            return msg
         note, link, stype, _ = await asyncio.to_thread(social.make_note, post, topics)
     else:
         note = await asyncio.to_thread(brain.note_from_text, text_or_link, topics)

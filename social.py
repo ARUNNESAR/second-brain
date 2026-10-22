@@ -9,6 +9,8 @@ import os
 import re
 import shutil
 import tempfile
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -78,6 +80,13 @@ def clean_url(url):
 
 def _workdir():
     os.makedirs(TMP_ROOT, exist_ok=True)
+    for old in os.listdir(TMP_ROOT):  # clean up folders a crashed fetch left behind
+        p = os.path.join(TMP_ROOT, old)
+        try:
+            if time.time() - os.path.getmtime(p) > 3600:
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
     return tempfile.mkdtemp(dir=TMP_ROOT)
 
 
@@ -152,6 +161,7 @@ def _instagram_caption(url):
 def fetch_x(url):
     user, sid = X_RE.search(url).groups()
     post = Post(url=f"https://x.com/{user}/status/{sid}", kind="x", workdir=_workdir())
+    not_found, media = False, {}
     try:
         data = json.load(_get(f"https://api.fxtwitter.com/{user}/status/{sid}"))
         t = data["tweet"]
@@ -159,22 +169,29 @@ def fetch_x(url):
         parts = [t.get("text") or ""]
         if t.get("quote"):
             q = t["quote"]
-            parts.append(f'Quoted post by @{q["author"]["screen_name"]}: {q.get("text", "")}')
+            parts.append(f'Quoted post by @{q.get("author", {}).get("screen_name", "?")}: {q.get("text", "")}')
         art = t.get("article")
         if art:
             parts.append(f'Article: {art.get("title", "")}\n{art.get("preview_text", "")}')
         post.text = "\n\n".join(p for p in parts if p).strip()
-        media = (t.get("media") or {})
+        media = t.get("media") or {}
+    except Exception as e:
+        post.note = f"used the basic version ({str(e)[:80]})"
+        post.text = _x_oembed(post.url)
+        not_found = post.text is None  # X's own embed says the post doesn't exist
+        post.text = post.text or ""
+    try:  # media separately: a too-big video must not throw away the post text
         for i, v in enumerate(media.get("videos") or []):
             post.media.append((_download(v["url"], os.path.join(post.workdir, f"v{i}.mp4")), "video/mp4"))
         for i, p in enumerate((media.get("photos") or [])[:4]):
             post.media.append((_download(p["url"], os.path.join(post.workdir, f"p{i}.jpg")), "image/jpeg"))
     except Exception as e:
-        post.note = f"used the basic version ({str(e)[:80]})"
-        post.text = _x_oembed(post.url)
+        post.note = f"couldn't download the media ({str(e)[:60]})"
     if not post.text and not post.media:
         post.cleanup()
-        raise Gone("Couldn't read that X post (deleted or private?). Send a screenshot instead.")
+        if not_found:
+            raise Gone("Couldn't read that X post (deleted or private?). Send a screenshot instead.")
+        raise Blocked("X isn't answering right now.")
     return post
 
 
@@ -183,6 +200,11 @@ def _x_oembed(url):
     try:
         q = "https://publish.twitter.com/oembed?omit_script=1&url=" + urllib.parse.quote(url, safe="")
         h = json.load(_get(q)).get("html", "")
+    except urllib.error.HTTPError as e:
+        return None if e.code == 404 else ""  # None = deleted / doesn't exist
+    except Exception:
+        return ""
+    try:
         h = re.sub(r"<br\s*/?>", "\n", h)
         return html.unescape(re.sub(r"<[^>]+>", " ", h)).strip()
     except Exception:
@@ -212,11 +234,18 @@ def fetch_linkedin(url):
             d = json.loads(m.group(1))
         except Exception:
             continue
+        if isinstance(d, list):  # some pages wrap the data in a list or an @graph
+            d = next((x for x in d if isinstance(x, dict)), {})
+        if isinstance(d.get("@graph"), list):
+            d = next((x for x in d["@graph"] if isinstance(x, dict) and x.get("articleBody")), d)
+        if not isinstance(d, dict):
+            continue
         if d.get("articleBody") or d.get("text"):
             post.text = (d.get("headline", "") + "\n\n" if d.get("@type") == "Article" else "") + \
                 (d.get("articleBody") or d.get("text"))
             a = d.get("author") or {}
-            post.author = (a[0] if isinstance(a, list) and a else a).get("name", "") if a else ""
+            a = a[0] if isinstance(a, list) and a else a
+            post.author = a.get("name", "") if isinstance(a, dict) else str(a or "")
             img = d.get("image")
             for i in (img if isinstance(img, list) else [img] if img else []):
                 images.append(i.get("url") if isinstance(i, dict) else i)

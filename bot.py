@@ -144,7 +144,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     replied = msg.reply_to_message
     if replied and replied.from_user and replied.from_user.is_bot:
-        m = re.search(r"#(\d+)", replied.text or "")
+        m = SCOPED_RE.match(replied.text or "")
         if m:  # a reply to one of the bot's save messages = a question about THAT save
             await ask(update, text, only_id=int(m.group(1)))
             return
@@ -158,6 +158,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await ask(update, text)
 
+
+# bot messages that are about ONE save: replying to them asks about that save
+SCOPED_RE = re.compile(r"^(?:✅ Saved|🔁 Saved later|📥 Got it|💡 Remember this\?)? ?#(\d+)\b")
 
 _texts = {}  # message_id -> long text waiting for the Save/Ask choice
 
@@ -309,29 +312,43 @@ async def process_queue(context: ContextTypes.DEFAULT_TYPE):
             try:
                 note, clean, kind, warning = await asyncio.to_thread(_make_note, url, kind, caption or "")
                 await _store(note, kind, clean, save_id)
-                text, markup = _saved_reply(save_id, note)
-                if warning:
-                    text += "\n(only the caption/text could be read)"
-                await _tell(context.bot, save_id, text, markup)
             except Exception as e:
                 log.exception("queue: #%s failed", save_id)
-                s = str(e)
-                if isinstance(e, social.Gone) or "Video unavailable" in s or "Private video" in s:
-                    # deleted / private / empty: retrying won't help, say so now
-                    await asyncio.to_thread(db.set_status, save_id, "failed")
-                    await _tell(context.bot, save_id, f"❌ #{save_id} can't be read: it looks deleted or private.\n"
-                                                      f"{url}\nSend a screenshot of it if you still have it.")
-                    continue
-                wait = 120 if isinstance(e, social.Blocked) else 60 if ("429" in s or "RESOURCE_EXHAUSTED" in s) else 30
-                status = await asyncio.to_thread(db.postpone, save_id, wait)
-                if status == "failed":
-                    await _tell(context.bot, save_id, f"❌ Couldn't save #{save_id} after several tries.\n{url}\n"
-                                                      f"Send a screenshot of it instead.")
-                elif save_id in _queue_msgs:  # first failure: tell once, quietly
-                    await _tell(context.bot, save_id, f"⏳ #{save_id} is blocked for now. I'll retry by myself and "
-                                                      f"message you when it's saved.")
+                try:
+                    await _queue_failed(context.bot, save_id, url, e)
+                except Exception:
+                    log.exception("queue: couldn't record failure of #%s", save_id)
+            else:
+                # Saved. A problem telling Arun must not undo the save.
+                try:
+                    text, markup = _saved_reply(save_id, note)
+                    if warning:
+                        text += "\n(only the caption/text could be read)"
+                    await _tell(context.bot, save_id, text, markup)
+                except Exception:
+                    log.exception("queue: saved #%s but couldn't send the message", save_id)
             if kind == "instagram":
                 await asyncio.sleep(40)  # space out reels so Instagram doesn't block the server
+
+
+async def _queue_failed(bot, save_id, url, e):
+    s = str(e)
+    if isinstance(e, social.Gone) or "Video unavailable" in s or "Private video" in s:
+        # deleted / private / empty: retrying won't help, say so now
+        await asyncio.to_thread(db.set_status, save_id, "failed")
+        await _tell(bot, save_id, f"❌ #{save_id} can't be read: it looks deleted or private.\n"
+                                  f"{url}\nSend a screenshot of it if you still have it.")
+        return
+    wait = 120 if isinstance(e, social.Blocked) else 60 if ("429" in s or "RESOURCE_EXHAUSTED" in s) else 30
+    status = await asyncio.to_thread(db.postpone, save_id, wait)
+    if status is None:  # deleted while it was being processed
+        _queue_msgs.pop(save_id, None)
+    elif status == "failed":
+        await _tell(bot, save_id, f"❌ Couldn't save #{save_id} after several tries.\n{url}\n"
+                                  f"Send a screenshot of it instead.")
+    elif save_id in _queue_msgs:  # first failure: tell once, quietly
+        await _tell(bot, save_id, f"⏳ #{save_id} is blocked for now. I'll retry by myself and "
+                                  f"message you when it's saved.")
 
 
 async def save_youtube(update, context, url, caption):
@@ -359,13 +376,14 @@ async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(group) == 1:
             context.job_queue.run_once(flush_album, when=3, data=msg.media_group_id)
         return
-    if msg.photo:
-        file, mime = await msg.photo[-1].get_file(), "image/jpeg"
-    else:
-        file, mime = await msg.document.get_file(), msg.document.mime_type
-    data = bytes(await file.download_as_bytearray())
+    src = msg.photo[-1] if msg.photo else msg.document
+    if (src.file_size or 0) > MAX_TG_FILE:
+        await msg.reply_text("That image is over 20 MB, which Telegram doesn't let bots download. Send a smaller screenshot.")
+        return
     status = await msg.reply_text("⏳ Reading the screenshot…")
     try:
+        mime = "image/jpeg" if msg.photo else msg.document.mime_type
+        data = bytes(await (await src.get_file()).download_as_bytearray())
         topics = await asyncio.to_thread(db.topics)
         note = await asyncio.to_thread(brain.note_from_image, data, mime, topics, (msg.caption or "").strip())
         save_id = await _store(note, "image", None)
@@ -395,6 +413,8 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 _last_qa = {"at": 0.0, "q": "", "a": "", "id": None}  # previous question + answer (+ save it was about)
 FOLLOW_UP_SECONDS = 10 * 60
+# words that mean "the thing we were just talking about" (only then does a short question stay on that save)
+FOLLOW_UP_RE = re.compile(r"\b(it|that|this|these|those|them|they|why|more|again|explain|example|step|steps)\b", re.I)
 
 
 async def _answer(question, only_id=None):
@@ -403,13 +423,14 @@ async def _answer(question, only_id=None):
     rows = []
     try:
         recent = time.time() - _last_qa["at"] < FOLLOW_UP_SECONDS
-        if recent and not only_id and _last_qa["id"] and len(question) < 60:
+        if recent and not only_id and _last_qa["id"] and len(question) <= 40 and FOLLOW_UP_RE.search(question):
             only_id = _last_qa["id"]  # short follow-up after asking about one save: stay on that save
         history = f"Q: {_last_qa['q']}\nA: {_last_qa['a'][:1500]}" if recent else ""
         if only_id:
             row = await asyncio.to_thread(db.get, only_id)
             rows = [tuple(row) + (1.0,)] if row else []
             if not rows:
+                _last_qa["id"] = None
                 return f"Save #{only_id} doesn't exist anymore.", None
         else:
             # a short follow-up ("why?", "tell me more") is searched together with the previous question
@@ -465,12 +486,17 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🔎 Saves matching \"{words}\":", reply_markup=_list_markup(rows))
 
 
+def _fit_bytes(text, limit):
+    """Cut text to fit Telegram's 64-byte button data without breaking a letter (Tamil letters are 3 bytes)."""
+    return text.encode()[:limit].decode("utf-8", "ignore")
+
+
 async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await asyncio.to_thread(db.topic_counts)
     if not rows:
         await update.message.reply_text("Nothing saved yet.")
         return
-    buttons = [InlineKeyboardButton(f"{t} ({n})", callback_data=f"t:{t[:50]}") for t, n in rows]
+    buttons = [InlineKeyboardButton(f"{t} ({n})", callback_data="t:" + _fit_bytes(t, 60)) for t, n in rows]
     await update.message.reply_text("📚 Your topics. Tap one to see its saves:",
                                     reply_markup=InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]))
 
@@ -500,7 +526,8 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await asyncio.to_thread(db.all_saves)
-    out = [f"# My Second Brain: export {dt.date.today():%d %b %Y}\n\n{len(rows)} saves\n"]
+    today = dt.datetime.now(IST).date()
+    out = [f"# My Second Brain: export {today:%d %b %Y}\n\n{len(rows)} saves\n"]
     for i, created, stype, url, title, topic, summary, points, content, st in rows:
         out.append(f"\n---\n\n## #{i} {title or '(untitled)'}\n")
         out.append(f"- Saved: {created:%d %b %Y} · Type: {stype} · Topic: {topic or '-'} · Status: {st}")
@@ -513,7 +540,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if content:
             out.append(f"\n<details><summary>Original</summary>\n\n{content}\n\n</details>")
     buf = io.BytesIO("\n".join(out).encode("utf-8"))
-    buf.name = f"second-brain-{dt.date.today():%Y-%m-%d}.md"
+    buf.name = f"second-brain-{today:%Y-%m-%d}.md"
     await update.message.reply_document(buf, caption=f"All {len(rows)} saves.")
 
 
@@ -578,7 +605,8 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, sid = q.data.split(":")
     save_id = int(sid)
     await q.answer()
-    in_list = len(q.message.reply_markup.inline_keyboard) > 1 if q.message.reply_markup else False
+    kb = q.message.reply_markup.inline_keyboard if q.message.reply_markup else []
+    in_list = bool(kb) and kb[0][0].text.startswith("📖 #")  # rows from /find or /topics
     if action == "x" and in_list:  # from a /find or /topics list: confirm in a separate message, keep the list
         row = await asyncio.to_thread(db.get, save_id)
         await q.message.reply_text(f"Delete #{save_id}: {row[4] if row else '?'}?", reply_markup=InlineKeyboardMarkup([[
@@ -618,7 +646,7 @@ async def daily_tip(context: ContextTypes.DEFAULT_TYPE):
             return
         i, created, stype, url, title, topic, summary, points = row
         best = "\n".join(f"• {p}" for p in (points or [])[:3])
-        text = f"💡 Remember this? (saved {created:%d %b})\n\n{title}\n\n{best}"
+        text = f"💡 Remember this? #{i} (saved {created:%d %b})\n\n{title}\n\n{best}"
         await context.bot.send_message(OWNER, _short(text), reply_markup=_details_button(i),
                                        disable_web_page_preview=True)
     except Exception:
@@ -693,7 +721,7 @@ def build_app():
     app = (Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"].strip())
            .concurrent_updates(True).post_init(set_menu).build())
 
-    me = filters.User(user_id=OWNER)
+    me = filters.User(user_id=OWNER) & filters.UpdateType.MESSAGE  # edits of old messages are ignored
     app.add_handler(CommandHandler(["start", "help"], cmd_start, filters=me))
     app.add_handler(CommandHandler("note", cmd_note, filters=me))
     app.add_handler(CommandHandler("recent", cmd_recent, filters=me))

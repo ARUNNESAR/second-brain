@@ -1,29 +1,51 @@
 """Talks to the Supabase (Postgres) database: save notes, search them by meaning."""
 import os
 import re
+import threading
 
 import psycopg
+import psycopg.conninfo
+from psycopg_pool import ConnectionPool
 from pgvector import Vector
 from pgvector.psycopg import register_vector
 
 _SCHEMA = os.path.join(os.path.dirname(__file__), "schema.sql")
 
 
-def _connect(vectors=True):
+def _conninfo():
     # Built from the project ID + password in .env, so the user only had to paste the password.
     url = os.environ.get("DATABASE_URL", "")
     if url.startswith("postgres"):
-        conn = psycopg.connect(url, connect_timeout=15)
-    else:
-        ref = re.search(r"https://([a-z0-9]+)\.supabase\.co", url).group(1)
-        conn = psycopg.connect(
-            host=os.environ.get("DB_HOST", "aws-0-ap-northeast-2.pooler.supabase.com"),
-            port=5432, dbname="postgres", user=f"postgres.{ref}",
-            password=os.environ["DB_PASSWORD"].strip(), sslmode="require", connect_timeout=15,
-        )
-    if vectors:
-        register_vector(conn)
-    return conn
+        return url
+    ref = re.search(r"https://([a-z0-9]+)\.supabase\.co", url).group(1)
+    return psycopg.conninfo.make_conninfo(
+        host=os.environ.get("DB_HOST", "aws-0-ap-northeast-2.pooler.supabase.com"),
+        port=5432, dbname="postgres", user=f"postgres.{ref}",
+        password=os.environ["DB_PASSWORD"].strip(), sslmode="require", connect_timeout=15)
+
+
+def _configure(conn):
+    register_vector(conn)
+    conn.execute("set timezone to 'Asia/Kolkata'")  # dates shown to Arun are India time
+    conn.commit()
+
+
+_pool = None
+_pool_lock = threading.Lock()
+
+
+def _connect(vectors=True):
+    """A connection from a small shared pool. Supabase's free pooler allows only 15 clients at once,
+    so we keep at most 6 open and make extra requests wait their turn instead of failing."""
+    global _pool
+    if not vectors:  # only for setup, before the vector type may exist
+        return psycopg.connect(_conninfo())
+    with _pool_lock:
+        if _pool is None:
+            _pool = ConnectionPool(_conninfo(), min_size=1, max_size=int(os.environ.get("DB_POOL_SIZE", "6")),
+                                   configure=_configure, check=ConnectionPool.check_connection,
+                                   timeout=60, open=True)
+    return _pool.connection()
 
 
 def _vec(e):
@@ -145,10 +167,11 @@ def next_queued():
 def postpone(save_id, minutes, max_attempts=6):
     """Try again later; after max_attempts mark it failed. Returns the new status."""
     with _connect() as c:
-        return c.execute(
+        row = c.execute(
             """update saves set attempts = attempts + 1, next_try = now() + make_interval(mins => %s),
                       status = case when attempts + 1 >= %s then 'failed' else 'pending' end
-               where id = %s returning status""", (minutes, max_attempts, save_id)).fetchone()[0]
+               where id = %s returning status""", (minutes, max_attempts, save_id)).fetchone()
+        return row[0] if row else None  # None: the save was deleted meanwhile
 
 
 def retry_all():
@@ -165,20 +188,28 @@ def retry_one(save_id):
         c.execute("update saves set status = 'pending', attempts = 0, next_try = now() where id = %s", (save_id,))
 
 
+def _like(words):
+    """ILIKE pattern that treats % and _ as normal characters."""
+    return "%" + words.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
 def find(words, embedding, limit=8):
     """Saves matching some words: title/topic keyword matches first, then closest by meaning."""
     with _connect() as c:
         rows = c.execute(
             """select id, title, topic, created_at, status from saves
                where title ilike %s or topic ilike %s or source_url ilike %s
-               order by created_at desc limit %s""", (f"%{words}%",) * 3 + (limit,)).fetchall()
+               order by created_at desc limit %s""", (_like(words),) * 3 + (limit,)).fetchall()
         seen = {r[0] for r in rows}
         if len(rows) < limit:
+            # meaning matches only when one clearly stands out (nonsense words score ~0.62 against everything)
             more = c.execute(
-                """select id, title, topic, created_at, status from saves where embedding is not null
-                   and 1 - (embedding <=> %s) > 0.55 order by embedding <=> %s limit %s""",
+                """select id, title, topic, created_at, status, 1 - (embedding <=> %s) as score from saves
+                   where embedding is not null order by embedding <=> %s limit %s""",
                 (_vec(embedding), _vec(embedding), limit)).fetchall()
-            rows += [r for r in more if r[0] not in seen][: limit - len(rows)]
+            if more and more[0][5] >= 0.65:
+                bar = max(0.62, more[0][5] - 0.05)
+                rows += [r[:5] for r in more if r[5] >= bar and r[0] not in seen][: limit - len(rows)]
         return rows
 
 
@@ -190,8 +221,9 @@ def topic_counts():
 
 def by_topic(topic, limit=15):
     with _connect() as c:
-        return c.execute("""select id, title, topic, created_at, status from saves where topic = %s
-                            order by created_at desc limit %s""", (topic, limit)).fetchall()
+        # topic may be cut short (Telegram buttons hold 64 bytes), so match it as a prefix
+        return c.execute("""select id, title, topic, created_at, status from saves where topic like %s
+                            order by created_at desc limit %s""", (_like(topic)[1:], limit)).fetchall()
 
 
 def similar(embedding, exclude_id, threshold=0.9):
