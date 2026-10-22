@@ -1,4 +1,4 @@
-"""Put saves back from a backup file into the database.
+r"""Put saves back from a backup file into the database.
 
     .venv\\Scripts\\python restore.py second-brain-backup-2026-10-23.json.gz          (shows what it would do)
     .venv\\Scripts\\python restore.py second-brain-backup-2026-10-23.json.gz --apply  (actually restores)
