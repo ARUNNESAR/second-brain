@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import re
+import time
 from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
@@ -54,7 +55,8 @@ ASK: just type a question, e.g. "how do I handle price objections?"
 /retry  try again on links that failed
 /recap  recap of the last 7 days (it also comes by itself every Sunday 9 AM)
 
-Every other morning at 9 AM you get one old save to remember."""
+Every other morning at 9 AM you get one old save to remember (/reminders off to pause).
+Reply to any "✅ Saved #12" message with a question to ask about that save only."""
 
 
 def _short(text, limit=MAX_MSG):
@@ -75,6 +77,9 @@ def _friendly_error(e):
 def _saved_reply(save_id, note, prefix="✅ Saved"):
     """Short confirmation + a Details button (the full note only when Arun taps it)."""
     text = f"{prefix} #{save_id} · {note.topic}\n{note.title}"
+    dup = _similar.pop(save_id, None)
+    if dup:
+        text += f"\n\n⚠️ Looks like you already saved this: #{dup[0]} {dup[1]}\nTap 🗑 to remove this new copy."
     return text, _details_button(save_id)
 
 
@@ -101,14 +106,22 @@ def _make_note(url, kind, caption):
     return social.make_note(url, topics, caption)
 
 
+_similar = {}  # new save id -> (id, title) of an existing save that says almost the same thing
+
+
 async def _store(note, source_type, url, pending_id=None):
     vec = await asyncio.to_thread(brain.embed, brain.note_text_for_search(note))
     if pending_id:  # this link failed before: fill in the same save number
         await asyncio.to_thread(db.update_note, pending_id, note.title, note.topic, note.summary,
                                 note.key_points, note.content, vec)
-        return pending_id
-    return await asyncio.to_thread(db.add, source_type, url, note.title, note.topic, note.summary,
-                                   note.key_points, note.content, vec)
+        save_id = pending_id
+    else:
+        save_id = await asyncio.to_thread(db.add, source_type, url, note.title, note.topic, note.summary,
+                                          note.key_points, note.content, vec)
+    dup = await asyncio.to_thread(db.similar, vec, save_id)
+    if dup:
+        _similar[save_id] = dup
+    return save_id
 
 
 # ---------- handlers ----------
@@ -129,6 +142,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await save_link(update, context, u, caption)
         return
+    replied = msg.reply_to_message
+    if replied and replied.from_user and replied.from_user.is_bot:
+        m = re.search(r"#(\d+)", replied.text or "")
+        if m:  # a reply to one of the bot's save messages = a question about THAT save
+            await ask(update, text, only_id=int(m.group(1)))
+            return
     if msg.forward_origin:  # forwarded from another chat: that's something to remember, not a question
         await save_text(msg, text)
     elif len(text) > 280 or text.count("\n") >= 3:  # long text: could be a tip to save or a long question
@@ -171,7 +190,8 @@ async def on_save_or_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await save_text(q.message, text)
     else:
         status = await q.message.reply_text("🔎 Looking through your saves…")
-        await status.edit_text(await _answer(text), disable_web_page_preview=True)
+        answer, markup = await _answer(text)
+        await status.edit_text(answer, reply_markup=markup, disable_web_page_preview=True)
 
 
 # ---------- files: voice notes, videos, PDFs, screenshot groups ----------
@@ -296,6 +316,12 @@ async def process_queue(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.exception("queue: #%s failed", save_id)
                 s = str(e)
+                if isinstance(e, social.Gone) or "Video unavailable" in s or "Private video" in s:
+                    # deleted / private / empty: retrying won't help, say so now
+                    await asyncio.to_thread(db.set_status, save_id, "failed")
+                    await _tell(context.bot, save_id, f"❌ #{save_id} can't be read: it looks deleted or private.\n"
+                                                      f"{url}\nSend a screenshot of it if you still have it.")
+                    continue
                 wait = 120 if isinstance(e, social.Blocked) else 60 if ("429" in s or "RESOURCE_EXHAUSTED" in s) else 30
                 status = await asyncio.to_thread(db.postpone, save_id, wait)
                 if status == "failed":
@@ -367,14 +393,33 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(_friendly_error(e))
 
 
-async def _answer(question):
-    """Search the saves and write an answer with sources (plain text, ready to send)."""
+_last_qa = {"at": 0.0, "q": "", "a": "", "id": None}  # previous question + answer (+ save it was about)
+FOLLOW_UP_SECONDS = 10 * 60
+
+
+async def _answer(question, only_id=None):
+    """Search the saves and write an answer with sources. Returns (text, buttons or None).
+    only_id: answer from that one save (when Arun replies to a save's message)."""
+    rows = []
     try:
-        vec = await asyncio.to_thread(brain.embed, question, True)
-        rows = await asyncio.to_thread(db.search, vec, 6)
-        if not rows:
-            return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me."
-        text = await asyncio.to_thread(brain.answer, question, rows)
+        recent = time.time() - _last_qa["at"] < FOLLOW_UP_SECONDS
+        if recent and not only_id and _last_qa["id"] and len(question) < 60:
+            only_id = _last_qa["id"]  # short follow-up after asking about one save: stay on that save
+        history = f"Q: {_last_qa['q']}\nA: {_last_qa['a'][:1500]}" if recent else ""
+        if only_id:
+            row = await asyncio.to_thread(db.get, only_id)
+            rows = [tuple(row) + (1.0,)] if row else []
+            if not rows:
+                return f"Save #{only_id} doesn't exist anymore.", None
+        else:
+            # a short follow-up ("why?", "tell me more") is searched together with the previous question
+            query = f"{_last_qa['q']} {question}" if history and len(question) < 60 else question
+            vec = await asyncio.to_thread(brain.embed, query, True)
+            rows = await asyncio.to_thread(db.search, vec, 6)
+            if not rows:
+                return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me.", None
+        text = await asyncio.to_thread(brain.answer, question, rows, history, 30000 if only_id else 6000)
+        _last_qa.update(at=time.time(), q=question, a=text, id=only_id)
         cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 0 < int(n) <= len(rows)})
         sources = []
         for n in cited:
@@ -383,15 +428,21 @@ async def _answer(question):
             if r[3]:
                 line += f"\n{r[3]}"
             sources.append(line)
-        return _short(text + ("\n\nSources:\n" + "\n".join(sources) if sources else ""))
+        return _short(text + ("\n\nSources:\n" + "\n".join(sources) if sources else "")), None
     except Exception as e:
         log.exception("ask failed")
-        return _friendly_error(e)
+        s = str(e)
+        if rows and ("429" in s or "RESOURCE_EXHAUSTED" in s):
+            # Gemini's free limit is used up: still show the saves that match, so the answer isn't lost
+            return ("Gemini's free limit is used up for today, so I can't write an answer.\n"
+                    "These saves match your question. Tap to read:"), _list_markup([(r[0], r[4]) for r in rows[:5]])
+        return _friendly_error(e), None
 
 
-async def ask(update, question):
+async def ask(update, question, only_id=None):
     status = await update.message.reply_text("🔎 Looking through your saves…")
-    await status.edit_text(await _answer(question), disable_web_page_preview=True)
+    text, markup = await _answer(question, only_id)
+    await status.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
 
 
 def _list_markup(rows):
@@ -546,9 +597,22 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"🗑 Deleted #{save_id}" + (f": {gone[0]}" if gone else " (it was already gone)"))
 
 
+async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    arg = (context.args[0].lower() if context.args else "")
+    if arg in ("on", "off"):
+        await asyncio.to_thread(db.set_setting, "reminders", arg)
+        await update.message.reply_text("🔔 Daily reminders are ON (9 AM, Mon-Sat)." if arg == "on" else
+                                        "🔕 Daily reminders are OFF. The Sunday recap still comes. /reminders on to restart.")
+        return
+    now = await asyncio.to_thread(db.get_setting, "reminders", "on")
+    await update.message.reply_text(f"Daily reminders are {now.upper()}.\n/reminders off to pause, /reminders on to restart.")
+
+
 async def daily_tip(context: ContextTypes.DEFAULT_TYPE):
     """One old save a day, so it comes back before it's forgotten (each save rotates; least recent first)."""
     try:
+        if await asyncio.to_thread(db.get_setting, "reminders", "on") == "off":
+            return
         row = await asyncio.to_thread(db.pick_tip)
         if not row:
             return
@@ -619,6 +683,7 @@ async def set_menu(app):
         ("delete", "Remove a save, e.g. /delete 12"),
         ("recap", "Recap of the last 7 days"),
         ("retry", "Retry saves that failed"),
+        ("reminders", "Turn daily reminders on/off"),
         ("help", "How to use me"),
     ])
 
@@ -639,6 +704,7 @@ def build_app():
     app.add_handler(CommandHandler("fix", cmd_fix, filters=me))
     app.add_handler(CommandHandler("find", cmd_find, filters=me))
     app.add_handler(CommandHandler("topics", cmd_topics, filters=me))
+    app.add_handler(CommandHandler("reminders", cmd_reminders, filters=me))
     app.add_handler(MessageHandler(me & (filters.VOICE | filters.AUDIO), on_voice))
     app.add_handler(MessageHandler(me & (filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO), on_video))
     app.add_handler(MessageHandler(me & filters.Document.PDF, on_pdf))

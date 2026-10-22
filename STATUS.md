@@ -17,7 +17,9 @@ ChatGPT / Claude (MCP)      ┼→ Render server (second-brain-xbgr.onrender.com
 | Forwarded message | Forward it to the bot and it gets saved |
 | Find or delete an old save | `/find words` or `/topics`, then tap 📖 or 🗑 |
 | Save your own thought | `/note …` in the bot |
-| Ask in Telegram | Type your question to the bot (Gemini answers) |
+| Ask in Telegram | Type your question to the bot (Gemini answers). Follow-ups like `why?` work. |
+| Ask about ONE save | Reply to its `✅ Saved #12` message with your question |
+| Pause daily reminders | `/reminders off` (`/reminders on` to restart) |
 | Ask in ChatGPT (PC or phone) | New chat → **+** → turn on **Second Brain** → ask (ChatGPT answers from your notes) |
 | See or back up your saves | `/recent`, `/export` in the bot |
 | Daily reminder | One old save every morning 9 AM (Mon-Sat) |

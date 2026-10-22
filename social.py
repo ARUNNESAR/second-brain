@@ -28,6 +28,10 @@ class Blocked(RuntimeError):
     """The site refused us (rate limit / login wall). Usually temporary, so the link is retried later."""
 
 
+class Gone(RuntimeError):
+    """The post is deleted, private or empty. Retrying won't help."""
+
+
 @dataclass
 class Post:
     url: str                       # clean link we store
@@ -170,7 +174,7 @@ def fetch_x(url):
         post.text = _x_oembed(post.url)
     if not post.text and not post.media:
         post.cleanup()
-        raise RuntimeError("Couldn't read that X post (deleted or private?). Send a screenshot instead.")
+        raise Gone("Couldn't read that X post (deleted or private?). Send a screenshot instead.")
     return post
 
 
@@ -240,7 +244,7 @@ def fetch_linkedin(url):
         post.note = f"couldn't download the media ({str(e)[:60]})"
     if not post.text and not post.media:
         post.cleanup()
-        raise RuntimeError("Couldn't read that LinkedIn post (private or login-only?). Send a screenshot instead.")
+        raise Gone("Couldn't read that LinkedIn post (private or login-only?). Send a screenshot instead.")
     return post
 
 
@@ -347,7 +351,7 @@ def fetch_reddit(url):
         post.note = f"couldn't download the media ({str(e)[:60]})"
     if not post.text and not post.media:
         post.cleanup()
-        raise RuntimeError("That Reddit post looks empty or deleted. Send a screenshot instead.")
+        raise Gone("That Reddit post looks empty or deleted. Send a screenshot instead.")
     return post
 
 

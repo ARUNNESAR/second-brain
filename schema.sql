@@ -22,3 +22,6 @@ create index if not exists saves_created_idx on saves (created_at desc);
 alter table saves add column if not exists attempts int not null default 0;
 alter table saves add column if not exists next_try timestamptz not null default now();
 alter table saves add column if not exists last_shown timestamptz;
+
+-- Small settings (e.g. reminders on/off)
+create table if not exists settings (key text primary key, value text);

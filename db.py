@@ -194,6 +194,27 @@ def by_topic(topic, limit=15):
                             order by created_at desc limit %s""", (topic, limit)).fetchall()
 
 
+def similar(embedding, exclude_id, threshold=0.9):
+    """An existing save that means almost the same thing (likely a duplicate), or None."""
+    with _connect() as c:
+        return c.execute(
+            """select id, title from saves where id <> %s and embedding is not null
+               and 1 - (embedding <=> %s) > %s order by embedding <=> %s limit 1""",
+            (exclude_id, _vec(embedding), threshold, _vec(embedding))).fetchone()
+
+
+def get_setting(key, default=None):
+    with _connect() as c:
+        row = c.execute("select value from settings where key = %s", (key,)).fetchone()
+        return row[0] if row else default
+
+
+def set_setting(key, value):
+    with _connect() as c:
+        c.execute("insert into settings (key, value) values (%s, %s) on conflict (key) do update set value = excluded.value",
+                  (key, value))
+
+
 def set_status(save_id, status):
     with _connect() as c:
         c.execute("update saves set status = %s where id = %s", (status, save_id))

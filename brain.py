@@ -278,7 +278,7 @@ def weekly_recap(rows, throwback=None):
 
 
 ANSWER_RULES = """You are Arun's second brain. Answer his question using ONLY the saved notes below.
-- Plain, friendly English. Short: get to the useful advice fast. Use bullet points for steps.
+- Plain, friendly English. Short: get to the useful advice fast, no greeting. Use bullet points for steps.
 - After each fact, cite the note number like [1] or [2].
 - If the notes don't answer the question, say so honestly in one line, then mention the closest thing he did save (if any).
 - Never invent advice that isn't in the notes.
@@ -288,15 +288,17 @@ ANSWER_RULES = """You are Arun's second brain. Answer his question using ONLY th
 - Plain text only: no markdown headings, no ** bold **, no tables."""
 
 
-def answer(question, rows):
+def answer(question, rows, history="", excerpt=6000):
+    """history: the previous question + answer, so follow-ups like 'tell me more' make sense."""
     blocks = []
     for i, r in enumerate(rows, 1):
-        _, created, stype, url, title, topic, summary, points, content, _ = r
+        _, created, stype, url, title, topic, summary, points, content = r[:9]
         body = f"[{i}] {title} ({stype}, saved {created:%d %b %Y %H:%M}, topic: {topic})\nSummary: {summary}\nKey points:\n- " + "\n- ".join(points or [])
         if content:
-            body += f"\nOriginal (excerpt): {content[:6000]}"
+            body += f"\nOriginal (excerpt): {content[:excerpt]}"
         blocks.append(body)
-    resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + f"\n\nArun's question: {question}",
+    prev = f"\n\nEarlier in this chat (for context only):\n{history}" if history else ""
+    resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + prev + f"\n\nArun's question: {question}",
         config=types.GenerateContentConfig(system_instruction=ANSWER_RULES),
     )
     return resp.text.strip()
