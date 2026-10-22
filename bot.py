@@ -41,10 +41,12 @@ MAX_MSG = 4000
 
 HELP = """Your Second Brain 🧠
 
-SAVE: share a YouTube video, Instagram reel, or an X, LinkedIn or Reddit post, or send a screenshot. Add a comment with it if you like.
+SAVE: share a YouTube video, Instagram reel, or an X, LinkedIn or Reddit post. Or send screenshots, a voice note, a video file or a PDF. Forwarded messages get saved too.
 NOTE: /note <text> saves your own thought.
 ASK: just type a question, e.g. "how do I handle price objections?"
 
+/find <words>  find a save (to read or delete it)
+/topics  browse saves by topic
 /recent  last 10 saves
 /export  download everything as a file
 /fix <number> <correction>  correct a note that got something wrong
@@ -116,15 +118,120 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    urls = URL_RE.findall(text)
-    yt = [u for u in urls if brain.youtube_id(u)]
-    if yt:
-        await save_youtube(update, context, yt[0], URL_RE.sub("", text).strip())
-    elif urls:
-        await save_link(update, context, urls[0], URL_RE.sub("", text).strip())
+    msg = update.message
+    text = msg.text.strip()
+    urls = list(dict.fromkeys(URL_RE.findall(text)))
+    if urls:  # every link in the message gets saved, not just the first
+        caption = URL_RE.sub("", text).strip()
+        for u in urls:
+            if brain.youtube_id(u):
+                await save_youtube(update, context, u, caption)
+            else:
+                await save_link(update, context, u, caption)
+        return
+    if msg.forward_origin:  # forwarded from another chat: that's something to remember, not a question
+        await save_text(msg, text)
+    elif len(text) > 280 or text.count("\n") >= 3:  # long text: could be a tip to save or a long question
+        _texts[msg.message_id] = text
+        await msg.reply_text("Save this, or answer it as a question?", reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("💾 Save it", callback_data=f"sv:{msg.message_id}"),
+            InlineKeyboardButton("❓ Ask it", callback_data=f"ak:{msg.message_id}")]]))
     else:
         await ask(update, text)
+
+
+_texts = {}  # message_id -> long text waiting for the Save/Ask choice
+
+
+async def save_text(reply_to, text):
+    status = await reply_to.reply_text("⏳ Saving…")
+    try:
+        topics = await asyncio.to_thread(db.topics)
+        note = await asyncio.to_thread(brain.note_from_text, text, topics)
+        save_id = await _store(note, "note", None)
+        t, markup = _saved_reply(save_id, note)
+        await status.edit_text(t, reply_markup=markup)
+    except Exception as e:
+        log.exception("text save failed")
+        await status.edit_text(_friendly_error(e))
+
+
+async def on_save_or_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    action, mid = q.data.split(":")
+    text = _texts.pop(int(mid), None)
+    if not text:
+        await q.edit_message_text("I lost that text (the bot restarted). Please send it again.")
+        return
+    await q.edit_message_reply_markup(None)
+    if action == "sv":
+        await save_text(q.message, text)
+    else:
+        status = await q.message.reply_text("🔎 Looking through your saves…")
+        await status.edit_text(await _answer(text), disable_web_page_preview=True)
+
+
+# ---------- files: voice notes, videos, PDFs, screenshot groups ----------
+
+MAX_TG_FILE = 20 * 1024 * 1024  # Telegram lets bots download files up to 20 MB
+
+
+async def _save_files(reply_to, tg_files, kind, caption, label):
+    """Download Telegram files, let Gemini read them together, save one note."""
+    if any((f.file_size or 0) > MAX_TG_FILE for f, _ in tg_files):
+        await reply_to.reply_text("That file is over 20 MB, which Telegram doesn't let bots download. "
+                                  "Share the link instead (YouTube/Instagram/X…).")
+        return
+    status = await reply_to.reply_text(f"⏳ Reading the {label}…")
+    post = social.Post(url=None, kind=kind, text=caption, workdir=social._workdir())
+    try:
+        for n, (f, mime) in enumerate(tg_files):
+            path = os.path.join(post.workdir, f"f{n}")
+            await (await f.get_file()).download_to_drive(path)
+            post.media.append((path, mime))
+        topics = await asyncio.to_thread(db.topics)
+        note = await asyncio.to_thread(brain.note_from_post, post, topics, "")
+        save_id = await _store(note, kind, None)
+        t, markup = _saved_reply(save_id, note)
+        await status.edit_text(t, reply_markup=markup)
+    except Exception as e:
+        log.exception("%s save failed", kind)
+        await status.edit_text(_friendly_error(e) + f"\nPlease send the {label} again.")
+    finally:
+        post.cleanup()
+
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    f = msg.voice or msg.audio
+    await _save_files(msg, [(f, f.mime_type or "audio/ogg")], "voice", (msg.caption or "").strip(), "voice note")
+
+
+async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    f = msg.video or msg.video_note or msg.document
+    await _save_files(msg, [(f, getattr(f, "mime_type", None) or "video/mp4")], "video",
+                      (msg.caption or "").strip(), "video")
+
+
+async def on_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    await _save_files(msg, [(msg.document, "application/pdf")], "pdf", (msg.caption or "").strip(), "PDF")
+
+
+_albums = {}  # media_group_id -> list of messages (screenshots sent together)
+
+
+async def flush_album(context: ContextTypes.DEFAULT_TYPE):
+    msgs = _albums.pop(context.job.data, [])
+    if not msgs:
+        return
+    files = [(m.photo[-1], "image/jpeg") if m.photo else (m.document, m.document.mime_type) for m in msgs]
+    caption = " ".join((m.caption or "").strip() for m in msgs).strip()
+    await _save_files(msgs[0], files, "image", caption, f"{len(files)} screenshots")
 
 
 async def _save_url(update, context, url, clean, kind, caption):
@@ -220,6 +327,12 @@ async def save_link(update, context, url, caption):
 
 async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
+    if msg.media_group_id:  # several screenshots sent together: wait a moment, then save them as ONE note
+        group = _albums.setdefault(msg.media_group_id, [])
+        group.append(msg)
+        if len(group) == 1:
+            context.job_queue.run_once(flush_album, when=3, data=msg.media_group_id)
+        return
     if msg.photo:
         file, mime = await msg.photo[-1].get_file(), "image/jpeg"
     else:
@@ -254,14 +367,13 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(_friendly_error(e))
 
 
-async def ask(update, question):
-    status = await update.message.reply_text("🔎 Looking through your saves…")
+async def _answer(question):
+    """Search the saves and write an answer with sources (plain text, ready to send)."""
     try:
         vec = await asyncio.to_thread(brain.embed, question, True)
         rows = await asyncio.to_thread(db.search, vec, 6)
         if not rows:
-            await status.edit_text("Nothing saved yet. Share a YouTube video or a screenshot first, then ask me.")
-            return
+            return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me."
         text = await asyncio.to_thread(brain.answer, question, rows)
         cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 0 < int(n) <= len(rows)})
         sources = []
@@ -271,11 +383,55 @@ async def ask(update, question):
             if r[3]:
                 line += f"\n{r[3]}"
             sources.append(line)
-        reply = text + ("\n\nSources:\n" + "\n".join(sources) if sources else "")
-        await status.edit_text(_short(reply), disable_web_page_preview=True)
+        return _short(text + ("\n\nSources:\n" + "\n".join(sources) if sources else ""))
     except Exception as e:
         log.exception("ask failed")
-        await status.edit_text(_friendly_error(e))
+        return _friendly_error(e)
+
+
+async def ask(update, question):
+    status = await update.message.reply_text("🔎 Looking through your saves…")
+    await status.edit_text(await _answer(question), disable_web_page_preview=True)
+
+
+def _list_markup(rows):
+    """One row of buttons per save: 📖 #id title  |  🗑"""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"📖 #{i} {(title or '(untitled)')[:35]}", callback_data=f"d:{i}"),
+                                  InlineKeyboardButton("🗑", callback_data=f"x:{i}")]
+                                 for i, title, *_ in rows])
+
+
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    words = " ".join(context.args).strip()
+    if not words:
+        await update.message.reply_text("Type a few words you remember, like:\n/find cold calling")
+        return
+    vec = await asyncio.to_thread(brain.embed, words, True)
+    rows = await asyncio.to_thread(db.find, words, vec, 8)
+    if not rows:
+        await update.message.reply_text(f"Nothing found for \"{words}\". Try other words, or /topics.")
+        return
+    await update.message.reply_text(f"🔎 Saves matching \"{words}\":", reply_markup=_list_markup(rows))
+
+
+async def cmd_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = await asyncio.to_thread(db.topic_counts)
+    if not rows:
+        await update.message.reply_text("Nothing saved yet.")
+        return
+    buttons = [InlineKeyboardButton(f"{t} ({n})", callback_data=f"t:{t[:50]}") for t, n in rows]
+    await update.message.reply_text("📚 Your topics. Tap one to see its saves:",
+                                    reply_markup=InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]))
+
+
+async def on_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    topic = q.data[2:]
+    rows = await asyncio.to_thread(db.by_topic, topic, 15)
+    await q.message.reply_text(f"📚 {topic}: latest {len(rows)}", reply_markup=_list_markup(rows))
 
 
 async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -371,12 +527,20 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, sid = q.data.split(":")
     save_id = int(sid)
     await q.answer()
-    if action == "x":
+    in_list = len(q.message.reply_markup.inline_keyboard) > 1 if q.message.reply_markup else False
+    if action == "x" and in_list:  # from a /find or /topics list: confirm in a separate message, keep the list
+        row = await asyncio.to_thread(db.get, save_id)
+        await q.message.reply_text(f"Delete #{save_id}: {row[4] if row else '?'}?", reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
+            InlineKeyboardButton("✖ Cancel", callback_data=f"kk:{save_id}")]]))
+    elif action == "x":
         await q.edit_message_reply_markup(InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
             InlineKeyboardButton("✖ Cancel", callback_data=f"k:{save_id}")]]))
     elif action == "k":
         await q.edit_message_reply_markup(_details_button(save_id))
+    elif action == "kk":
+        await q.edit_message_text(f"Kept #{save_id} 👍")
     else:
         gone = await asyncio.to_thread(db.delete, save_id)
         await q.edit_message_text(f"🗑 Deleted #{save_id}" + (f": {gone[0]}" if gone else " (it was already gone)"))
@@ -446,6 +610,8 @@ async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
 async def set_menu(app):
     # Fills the "/" menu in Telegram so commands don't have to be remembered.
     await app.bot.set_my_commands([
+        ("find", "Find a save, e.g. /find cold calling"),
+        ("topics", "Browse saves by topic"),
         ("recent", "Last 10 saves"),
         ("note", "Save your own note"),
         ("export", "Download everything"),
@@ -471,10 +637,17 @@ def build_app():
     app.add_handler(CommandHandler("retry", cmd_retry, filters=me))
     app.add_handler(CommandHandler("recap", cmd_recap, filters=me))
     app.add_handler(CommandHandler("fix", cmd_fix, filters=me))
+    app.add_handler(CommandHandler("find", cmd_find, filters=me))
+    app.add_handler(CommandHandler("topics", cmd_topics, filters=me))
+    app.add_handler(MessageHandler(me & (filters.VOICE | filters.AUDIO), on_voice))
+    app.add_handler(MessageHandler(me & (filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO), on_video))
+    app.add_handler(MessageHandler(me & filters.Document.PDF, on_pdf))
     app.add_handler(MessageHandler(me & (filters.PHOTO | filters.Document.IMAGE), on_image))
     app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_details, pattern=r"^d:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^(x|xx|k):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^(x|xx|k|kk):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_save_or_ask, pattern=r"^(sv|ak):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_topic, pattern=r"^t:"))
     app.add_handler(MessageHandler(~me, ignore_strangers))
 
     app.job_queue.run_daily(daily_ping, time=dt.time(hour=3, minute=0))

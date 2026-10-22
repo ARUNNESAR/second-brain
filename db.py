@@ -165,6 +165,35 @@ def retry_one(save_id):
         c.execute("update saves set status = 'pending', attempts = 0, next_try = now() where id = %s", (save_id,))
 
 
+def find(words, embedding, limit=8):
+    """Saves matching some words: title/topic keyword matches first, then closest by meaning."""
+    with _connect() as c:
+        rows = c.execute(
+            """select id, title, topic, created_at, status from saves
+               where title ilike %s or topic ilike %s or source_url ilike %s
+               order by created_at desc limit %s""", (f"%{words}%",) * 3 + (limit,)).fetchall()
+        seen = {r[0] for r in rows}
+        if len(rows) < limit:
+            more = c.execute(
+                """select id, title, topic, created_at, status from saves where embedding is not null
+                   and 1 - (embedding <=> %s) > 0.55 order by embedding <=> %s limit %s""",
+                (_vec(embedding), _vec(embedding), limit)).fetchall()
+            rows += [r for r in more if r[0] not in seen][: limit - len(rows)]
+        return rows
+
+
+def topic_counts():
+    with _connect() as c:
+        return c.execute("""select topic, count(*) from saves where status = 'done' and topic is not null
+                            group by topic order by count(*) desc limit 30""").fetchall()
+
+
+def by_topic(topic, limit=15):
+    with _connect() as c:
+        return c.execute("""select id, title, topic, created_at, status from saves where topic = %s
+                            order by created_at desc limit %s""", (topic, limit)).fetchall()
+
+
 def set_status(save_id, status):
     with _connect() as c:
         c.execute("update saves set status = %s where id = %s", (status, save_id))

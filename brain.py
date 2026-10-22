@@ -178,8 +178,10 @@ def _upload(path, mime):
 
 def note_from_post(post, topics, caption=""):
     """post is a social.Post (Instagram reel/post or X post) with text and downloaded media."""
-    where = {"instagram": "Instagram reel/post", "x": "X (Twitter) post", "linkedin": "LinkedIn post", "reddit": "Reddit post (with its top comments)"}[post.kind]
-    intro = f"{where} by {post.author or 'unknown'}.\nPost text / caption:\n{post.text or '(none)'}"
+    where = {"instagram": "Instagram reel/post", "x": "X (Twitter) post", "linkedin": "LinkedIn post", "reddit": "Reddit post (with its top comments)",
+             "voice": "Voice note Arun recorded himself", "video": "Video file Arun sent", "pdf": "PDF document",
+             "images": "Set of screenshots Arun sent together", "text": "Text Arun forwarded"}.get(post.kind, "Item")
+    intro = f"{where}" + (f" by {post.author}" if post.author else "") + f".\nText / caption:\n{post.text or '(none)'}"
     if caption:
         intro += f"\n\nArun's own comment when saving: {caption}"
     parts, uploaded = [], []
@@ -192,9 +194,15 @@ def note_from_post(post, topics, caption=""):
                 f = _upload(path, mime)
                 uploaded.append(f)
                 parts.append(types.Part(file_data=types.FileData(file_uri=f.uri, mime_type=mime)))
-        has_video = bool(uploaded)
-        rule = ("the post text, then " + "a word-for-word transcript of everything spoken (translated to English if not English; mark unclear words as [unclear]), then a short list of any important text shown on screen. This is the stored original, so do not summarise it." if has_video else
-                "the full post text plus any text in the images, word for word.")
+        spoken = ("a word-for-word transcript of everything spoken (translated to English if not English; mark unclear "
+                  "words as [unclear]), then a short list of any important text shown on screen. This is the stored "
+                  "original, so do not summarise it.")
+        if post.kind == "pdf":
+            rule = "the full text of the document, word for word (this is the stored original, do not summarise it)."
+        elif any(m.startswith(("video/", "audio/")) for _, m in post.media):
+            rule = "the post text (if any), then " + spoken
+        else:
+            rule = "the full text plus any text in the images, word for word."
         resp = _generate(contents=parts + [intro + "\n\nMake a note of this post."],
                          config=_note_config(topics, rule))
         return _parse(resp)
