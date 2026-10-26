@@ -72,9 +72,12 @@ async def search_my_brain(query: str, limit: int = 6) -> str:
     limit = max(1, min(limit, 15))
     vec = await asyncio.to_thread(brain.embed, query, True)
     rows = await asyncio.to_thread(db.search, vec, limit)
+    waiting = await asyncio.to_thread(db.queue_size)
+    note = (f"\n\n(Note: {waiting} newly shared link(s) are still being processed and aren't searchable yet. "
+            f"They usually appear within a few minutes.)") if waiting else ""
     if not rows:
-        return "The second brain is empty: nothing saved yet."
-    return "\n\n---\n\n".join(_fmt(r) for r in rows)
+        return "The second brain is empty: nothing saved yet." + note
+    return "\n\n---\n\n".join(_fmt(r) for r in rows) + note
 
 
 @mcp.tool()

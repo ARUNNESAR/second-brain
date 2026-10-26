@@ -15,10 +15,14 @@ MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 EMBED_MODEL = "gemini-embedding-001"
 EMBED_DIM = 768
 
-# The free plan allows ~20 requests a day PER MODEL, so we walk down this list when one is used up or busy.
-# Best models first, lighter ones last. Together: roughly 140 requests a day.
-FALLBACK_MODELS = [MODEL, "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
-                   "gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"]
+# Free plan: the Flash models allow only ~20 requests a day each, the Flash-Lite models ~500.
+# So the jobs are split: SAVING (lots of requests, mostly reading/extracting) uses Lite first, and keeps the
+# scarce Flash quota for ANSWERING (where reasoning quality matters). Each list falls back to the other models.
+FLASH_MODELS = [MODEL, "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+LITE_MODELS = ["gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite"]
+ANSWER_MODELS = FLASH_MODELS + LITE_MODELS
+SAVE_MODELS = LITE_MODELS + FLASH_MODELS
+FALLBACK_MODELS = ANSWER_MODELS  # (kept for older callers)
 
 _client = None
 _used_up = {}  # model -> time until which we skip it (its daily free quota ran out)
@@ -37,9 +41,9 @@ def client():
     return _client
 
 
-def _generate(contents, config):
+def _generate(contents, config, models=None):
     last = None
-    for model in dict.fromkeys(FALLBACK_MODELS):
+    for model in dict.fromkeys(models or ANSWER_MODELS):
         if _used_up.get(model, 0) > time.time():
             continue
         try:
@@ -96,6 +100,30 @@ def _parse(resp):
     return Note(**json.loads(resp.text))
 
 
+# Gemini refuses to copy long stretches of published videos word for word ("RECITATION" = copyright block),
+# which used to make whole saves fail. This rule is always allowed:
+DETAILED_NOTES = ("detailed notes of everything useful that is said and shown, in order, in your own words. Quote short "
+                  "key lines (under 15 words) exactly, in quotes. List any important text shown on screen. "
+                  "Do not copy long passages word for word.")
+
+
+def _note_call(contents, topics, content_rule, resolution=None):
+    """Make a note with the cheap, high-quota Lite models first. If Gemini blocks or empties the answer
+    (often a copyright 'recitation' block on a full transcript), retry with detailed notes, then a plain note."""
+    last = None
+    for rule in dict.fromkeys([content_rule, DETAILED_NOTES, "write an empty string."]):
+        cfg = _note_config(topics, rule)
+        if resolution:
+            cfg.media_resolution = resolution
+        try:
+            return _parse(_generate(contents=contents, config=cfg, models=SAVE_MODELS))
+        except (RuntimeError, ValueError, json.JSONDecodeError) as e:
+            if "RESOURCE_EXHAUSTED" in str(e):
+                raise
+            last = e  # empty / blocked / cut-off JSON: try the safer rule
+    raise last
+
+
 # ---------- YouTube ----------
 
 def youtube_id(url):
@@ -133,23 +161,16 @@ def note_from_youtube(url, topics, caption=""):
     extra = f"\nArun's own comment when saving: {caption}" if caption else ""
 
     if transcript and len(transcript) > 200:
-        # Cheap route: read the transcript as text.
-        resp = _generate(contents=f"YouTube video: {yt_title or clean_url}{extra}\n\nTranscript:\n{transcript[:400_000]}",
-            config=_note_config(topics, "write an empty string (the transcript is stored separately)."),
-        )
-        note = _parse(resp)
+        # Cheap route: read the transcript as text (works from home internet; YouTube blocks it from servers).
+        note = _note_call(f"YouTube video: {yt_title or clean_url}{extra}\n\nTranscript:\n{transcript[:400_000]}",
+                          topics, "write an empty string (the transcript is stored separately).")
         note.content = transcript
     else:
-        # No captions: let Gemini watch the video itself (low resolution keeps long videos within free limits).
-        cfg = _note_config(topics, "a word-for-word transcript of everything spoken (translated to English if not English; mark unclear words as [unclear]), then a short list of any important text shown on screen. This is the stored original, so do not summarise it.")
-        cfg.media_resolution = types.MediaResolution.MEDIA_RESOLUTION_LOW
-        resp = _generate(contents=types.Content(parts=[
-                types.Part(file_data=types.FileData(file_uri=clean_url)),
-                types.Part(text=f"Make a note of this video.{extra}"),
-            ]),
-            config=cfg,
-        )
-        note = _parse(resp)
+        # No captions (always the case on the server): Gemini watches the video itself, at low resolution so long
+        # videos fit the free limits, and writes detailed notes (a full transcript would be copyright-blocked).
+        note = _note_call(types.Content(parts=[types.Part(file_data=types.FileData(file_uri=clean_url)),
+                                               types.Part(text=f"Make a note of this video.{extra}")]),
+                          topics, DETAILED_NOTES, resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW)
     if yt_title and not note.title:
         note.title = yt_title
     return note, clean_url
@@ -159,11 +180,8 @@ def note_from_youtube(url, topics, caption=""):
 
 def note_from_image(image_bytes, mime, topics, caption=""):
     extra = f"\nArun's own comment when saving: {caption}" if caption else ""
-    resp = _generate(contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime),
-                  f"Make a note of this screenshot.{extra}"],
-        config=_note_config(topics, "all the readable text in the image, word for word."),
-    )
-    return _parse(resp)
+    return _note_call([types.Part.from_bytes(data=image_bytes, mime_type=mime), f"Make a note of this screenshot.{extra}"],
+                      topics, "all the readable text in the image, word for word.")
 
 
 # ---------- Instagram / X posts ----------
@@ -217,9 +235,7 @@ def note_from_post(post, topics, caption=""):
             rule = "the post text (if any), then " + spoken
         else:
             rule = "the full text plus any text in the images, word for word."
-        resp = _generate(contents=parts + [intro + "\n\nMake a note of this post."],
-                         config=_note_config(topics, rule))
-        return _parse(resp)
+        return _note_call(parts + [intro + "\n\nMake a note of this post."], topics, rule)
     finally:
         for f in uploaded:  # don't leave copies on Google's side
             try:
@@ -233,7 +249,7 @@ def read_url(url, what):
     resp = _generate(
         contents=f"Open this page: {url}\nCopy, word for word: {what}. Do not summarise. "
                  f"If you cannot open the page or it doesn't exist, reply exactly CANNOT_OPEN.",
-        config=types.GenerateContentConfig(tools=[types.Tool(url_context=types.UrlContext())]))
+        config=types.GenerateContentConfig(tools=[types.Tool(url_context=types.UrlContext())]), models=SAVE_MODELS)
     return (resp.text or "").strip()
 
 
@@ -252,7 +268,8 @@ def screen_text_youtube(url):
     resp = _generate(contents=types.Content(parts=[types.Part(file_data=types.FileData(file_uri=url)),
                                                    types.Part(text="Copy the on-screen text.")]),
                      config=types.GenerateContentConfig(system_instruction=SCREEN_RULES,
-                                                        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM))
+                                                        media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM),
+                     models=SAVE_MODELS)
     return (resp.text or "").strip()
 
 
@@ -271,7 +288,7 @@ def screen_text_post(post):
         if not parts:
             return "NO_SCREEN_TEXT"
         resp = _generate(contents=parts + ["Copy the on-screen text."],
-                         config=types.GenerateContentConfig(system_instruction=SCREEN_RULES))
+                         config=types.GenerateContentConfig(system_instruction=SCREEN_RULES), models=SAVE_MODELS)
         return (resp.text or "").strip()
     finally:
         for f in uploaded:
@@ -293,7 +310,7 @@ def find_offer(title, author, text):
             system_instruction="Does the creator offer an extra resource (a prompt, template, guide, website, link, "
                                "file) that viewers get by commenting a word, DMing, following a link in bio, or a link "
                                "in the text? Only report what is actually stated. Use empty strings/lists when none.",
-            response_mime_type="application/json", response_schema=Offer))
+            response_mime_type="application/json", response_schema=Offer), models=SAVE_MODELS)
     return resp.parsed if resp.parsed else Offer(**json.loads(resp.text or "{}"))
 
 
@@ -328,17 +345,14 @@ def image_text(image_bytes, mime):
     """All text in a screenshot, word for word (for screenshots attached to an existing save)."""
     resp = _generate(contents=[types.Part.from_bytes(data=image_bytes, mime_type=mime),
                                "Copy all the text in this image, word for word. Keep line breaks."],
-                     config=types.GenerateContentConfig())
+                     config=types.GenerateContentConfig(), models=SAVE_MODELS)
     return (resp.text or "").strip()
 
 
 # ---------- Plain notes ----------
 
 def note_from_text(text, topics):
-    resp = _generate(contents=f"Arun typed this note to remember:\n{text}",
-        config=_note_config(topics, "Arun's note exactly as he typed it."),
-    )
-    note = _parse(resp)
+    note = _note_call(f"Arun typed this note to remember:\n{text}", topics, "Arun's note exactly as he typed it.")
     note.content = text
     return note
 
@@ -386,15 +400,22 @@ def weekly_recap(rows, throwback=None):
     return (resp.text or "").strip()
 
 
-ANSWER_RULES = """You are Arun's second brain. Answer his question using ONLY the saved notes below.
-- Plain, friendly English. Short: get to the useful advice fast, no greeting. Use bullet points for steps.
-- After each fact, cite the note number like [1] or [2].
-- If the notes don't answer the question, say so honestly in one line, then mention the closest thing he did save (if any).
-- Never invent advice that isn't in the notes.
-- If the notes DISAGREE with each other on his question, never blend them and never silently pick one. Start with
-  "Your saves disagree:" then give each side in one line with its citation and saved date, say which is newer,
-  and add the reason each side gives (if the notes give one). Let Arun decide.
-- Plain text only: no markdown headings, no ** bold **, no tables."""
+ANSWER_RULES = """You are Arun's sharp, practical advisor. His saved notes (from videos and posts he chose to learn
+from) are your main source. Think about HIS situation first, then use the notes to tell him what to actually do.
+
+How to answer:
+1. Start with the direct answer for his situation in 1-2 lines. No greeting, no restating the question.
+2. Then the concrete moves: what to do and, when it fits, the exact words to say. Pull the specific techniques, steps,
+   numbers and example lines out of the notes and APPLY them to his case. Don't just list what each video said.
+3. When several notes help, combine them into one plan (e.g. first X from [1], then Y from [3]).
+4. Cite the note after each point that comes from it, like [1] or [2].
+5. If the notes only partly cover it, you may add your own reasoning, clearly marked with "My take:". Keep it short and
+   never present it as something he saved.
+6. If nothing in the notes fits, say so in one line, then give a short "My take:".
+7. If the notes DISAGREE, don't blend them or quietly pick one: start with "Your saves disagree:", give each side in one
+   line with its citation, saved date and reason, say which is newer, and let Arun decide.
+Style: plain, friendly English like a smart friend. Short (aim for under 200 words). Bullet points for steps.
+Plain text only: no markdown headings, no ** bold **, no tables."""
 
 
 def answer(question, rows, history="", excerpt=6000):
@@ -408,6 +429,8 @@ def answer(question, rows, history="", excerpt=6000):
         blocks.append(body)
     prev = f"\n\nEarlier in this chat (for context only):\n{history}" if history else ""
     resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + prev + f"\n\nArun's question: {question}",
-        config=types.GenerateContentConfig(system_instruction=ANSWER_RULES),
+        config=types.GenerateContentConfig(system_instruction=ANSWER_RULES,
+                                           thinking_config=types.ThinkingConfig(thinking_budget=2048)),
+        models=ANSWER_MODELS,  # the best models first: reasoning quality matters most here
     )
     return (resp.text or "").strip()
