@@ -101,9 +101,20 @@ def _saved_reply(save_id, note, prefix="✅ Saved", kind=None):
     return text, markup
 
 
-def _details_button(save_id):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📖 Read note", callback_data=f"d:{save_id}"),
-                                  InlineKeyboardButton("🗑 Delete", callback_data=f"x:{save_id}")]])
+def _details_button(save_id, more=False, kind=None):
+    """The one-tap buttons under every save: 📖 Read · 🗑 Delete · ⋯ More (✅ It worked, ❓ Ask about it, and for
+    videos/posts 📝 Screen text, 🎁 Get resource)."""
+    rows = [[InlineKeyboardButton("📖 Read", callback_data=f"d:{save_id}"),
+             InlineKeyboardButton("🗑 Delete", callback_data=f"x:{save_id}")]]
+    if not more:
+        rows[0].append(InlineKeyboardButton("⋯ More", callback_data=f"m:{save_id}"))
+        return InlineKeyboardMarkup(rows)
+    rows.append([InlineKeyboardButton("✅ It worked for me", callback_data=f"wk:{save_id}"),
+                 InlineKeyboardButton("❓ Ask about it", callback_data=f"aq:{save_id}")])
+    if kind in VIDEO_KINDS:
+        rows.append([InlineKeyboardButton("📝 Screen text", callback_data=f"st:{save_id}"),
+                     InlineKeyboardButton("🎁 Get resource", callback_data=f"rs:{save_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _details_text(row):
@@ -147,13 +158,15 @@ async def _saved_quietly(save_id, note, msg_id, reply_to=None, warning=""):
     """Saved: 👌 on his message, and only speak if something needs his attention (a likely duplicate)."""
     await asyncio.to_thread(db.set_tg_msg, save_id, msg_id)
     await _react(msg_id, "👌")
-    await _tip_once("saved", "👌 Saved! From now on, when you share something: 👀 means I'm reading it, 👌 means it's "
-                            "saved. No need to wait, keep sharing.", msg_id)
     dup = _similar.pop(save_id, None)
-    if dup and _bot:
-        await _bot.send_message(OWNER, f"👌 Saved #{save_id}, but it looks like #{dup[0]} {dup[1]}. "
-                                       f"Say \"delete #{save_id}\" if it's a repeat.",
-                                reply_to_message_id=msg_id, allow_sending_without_reply=True)
+    if _bot:  # a small card under his message: the title + one-tap buttons
+        text = f"👌 {note.title}" + (f"\n⚠️ Looks like a repeat of “{dup[1]}”. Tap 🗑 if you don't need both." if dup else "")
+        row = await asyncio.to_thread(db.get, save_id)
+        await _bot.send_message(OWNER, text, reply_to_message_id=msg_id, allow_sending_without_reply=True,
+                                reply_markup=_details_button(save_id, kind=row[2] if row else None),
+                                disable_notification=True)
+    await _tip_once("saved", "Tip: 👀 = I'm reading it, 👌 = saved. Under each save you get buttons to read it, delete "
+                             "it, or more (ask about it, mark it as worked…).")
 
 
 async def _store(note, source_type, url, pending_id=None):
@@ -229,13 +242,14 @@ async def on_example(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(HELP)
 
 
-async def _tip_once(key, text, reply_to_id=None):
+async def _tip_once(key, text, reply_to_id=None, markup=None):
     """A short tip the FIRST time he meets a feature, never again. Teaches by doing, no guide needed."""
     if not _bot or await asyncio.to_thread(db.get_setting, f"tip_{key}", ""):
         return
     await asyncio.to_thread(db.set_setting, f"tip_{key}", "shown")
     try:
-        await _bot.send_message(OWNER, text, reply_to_message_id=reply_to_id, allow_sending_without_reply=True)
+        await _bot.send_message(OWNER, text, reply_to_message_id=reply_to_id, allow_sending_without_reply=True,
+                                reply_markup=markup)
     except Exception:
         log.debug("tip %s not sent", key)
 
@@ -260,6 +274,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await attach_to(msg, reply_save, text=re.sub(r"^add:?\s*", "", text, flags=re.I))  # DM link / text
         else:
             await handle_words(msg, context, text, reply_save=reply_save)  # "screen text", "worked", a question…
+        return
+    if "ask" in _awaiting and not urls:  # he tapped "❓ Ask about it": this is the question
+        await respond(msg, text, only_id=_awaiting.pop("ask"))
         return
     if _awaiting.pop("practice", None) and not urls:  # he tapped "Practice a conversation": this is the situation
         await start_practice(msg, text)
@@ -702,7 +719,8 @@ async def _send_answer(status, question, only_id=None, previous=None, rows=None,
     if used and markup is not None and await _want_voice(by_voice):
         asyncio.create_task(_voice_answer(question, text, status.message_id))
         await _tip_once("voice", "🎙 You asked by voice, so I'll answer by voice too. Say \"voice replies off\" if you "
-                                   "prefer text, or \"always reply by voice\".")
+                                   "prefer text, or \"always reply by voice\".",
+                        markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔇 Text only", callback_data="vo:off")]]))
     elif used and markup is not None:
         await _tip_once("answer", "Tip: if an answer misses the mark, tap 👎 and I'll try again. To ask about one "
                                     "thing you saved, reply to the link you shared and ask.")
@@ -864,8 +882,10 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not arg.isdigit():
         await update.message.reply_text("Which one? Reply to that save and say \"delete\", or say \"delete the last one\".")
         return
-    gone = await asyncio.to_thread(db.delete, int(arg))
-    await update.message.reply_text(f"🗑 Deleted “{gone[0]}”" if gone else "I couldn't find that save.")
+    title = await asyncio.to_thread(db.soft_delete, int(arg))
+    await update.message.reply_text(f"🗑 Deleted “{title}”" if title else "I couldn't find that save.",
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                                        "↩ Undo", callback_data=f"u:{arg}")]]) if title else None)
 
 
 async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -915,31 +935,84 @@ async def on_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """🗑 Delete button: x:<id> asks to confirm, xx:<id> deletes, k:<id> cancels."""
+    """🗑 = deleted in ONE tap, with ↩ Undo (kept hidden for a day, then removed for good). Old confirm buttons
+    (xx/k/kk) still work."""
     q = update.callback_query
     if q.from_user.id != OWNER:
         return
     action, sid = q.data.split(":")
     save_id = int(sid)
-    await q.answer()
     kb = q.message.reply_markup.inline_keyboard if q.message.reply_markup else []
-    in_list = len(kb) > 1 or (bool(kb) and len(kb[0]) == 2 and kb[0][1].text == "🗑")  # a list of saves
-    if action == "x" and in_list:  # from a /find or /topics list: confirm in a separate message, keep the list
-        row = await asyncio.to_thread(db.get, save_id)
-        await q.message.reply_text(f"Delete this save?\n“{row[4] if row else '?'}”", reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
-            InlineKeyboardButton("✖ Cancel", callback_data=f"kk:{save_id}")]]))
-    elif action == "x":
-        await q.edit_message_reply_markup(InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
-            InlineKeyboardButton("✖ Cancel", callback_data=f"k:{save_id}")]]))
-    elif action == "k":
+    if action in ("k", "kk"):
+        await q.answer("Kept 👍")
         await q.edit_message_reply_markup(_details_button(save_id))
-    elif action == "kk":
-        await q.edit_message_text("Okay, kept it 👍")
+        return
+    title = await asyncio.to_thread(db.soft_delete, save_id)
+    await q.answer("🗑 Deleted" if title else "Already deleted")
+    undo = InlineKeyboardMarkup([[InlineKeyboardButton("↩ Undo", callback_data=f"u:{save_id}")]])
+    in_list = len(kb) > 1 and all(len(r) == 2 and r[1].text == "🗑" for r in kb)
+    if in_list:  # a list of saves: take that row out, and confirm with Undo underneath
+        rest = [r for r in kb if r[1].callback_data != f"x:{save_id}"]
+        await q.edit_message_reply_markup(InlineKeyboardMarkup(rest) if rest else None)
+        await q.message.reply_text(f"🗑 Deleted “{title or 'that save'}”", reply_markup=undo, disable_notification=True)
     else:
-        gone = await asyncio.to_thread(db.delete, save_id)
-        await q.edit_message_text(f"🗑 Deleted “{gone[0]}”" if gone else "🗑 That one was already deleted.")
+        await q.edit_message_text(f"🗑 Deleted “{title or 'that save'}”", reply_markup=undo)
+
+
+async def on_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    save_id = int(q.data.split(":")[1])
+    title = await asyncio.to_thread(db.restore, save_id)
+    await q.answer("↩ Restored" if title else "Too late to undo, sorry")
+    if title:
+        await q.edit_message_text(f"↩ Back: “{title}”", reply_markup=_details_button(save_id))
+    else:
+        await q.edit_message_reply_markup(None)
+
+
+async def on_save_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """⋯ More (m:), ✅ It worked (wk:), ❓ Ask about it (aq:)."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    action, sid = q.data.split(":")
+    save_id = int(sid)
+    row = await asyncio.to_thread(db.get, save_id)
+    if not row:
+        await q.answer("That save was deleted.")
+        return
+    if action == "m":
+        await q.answer()
+        await q.edit_message_reply_markup(_details_button(save_id, more=True, kind=row[2]))
+    elif action == "wk":
+        await asyncio.to_thread(db.mark_proven, save_id)
+        await q.answer("✅ Marked as proven. It'll come first in answers.")
+        await q.edit_message_reply_markup(_details_button(save_id))
+    elif action == "aq":
+        await q.answer()
+        _awaiting["ask"] = save_id
+        await q.message.reply_text(f"❓ What do you want to know about “{row[4]}”? Type it or send a voice note.")
+
+
+async def on_setting_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """🔕 Pause reminders / 🔔 back on (rem:off|on), 🔇 Text only / 🎙 Voice again (vo:off|auto)."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    kind, value = q.data.split(":")
+    key = "reminders" if kind == "rem" else "voice"
+    await asyncio.to_thread(db.set_setting, key, value)
+    if kind == "rem":
+        flip = ("🔔 Turn reminders back on", "rem:on") if value == "off" else ("🔕 Pause reminders", "rem:off")
+        await q.answer("🔕 Daily reminders paused" if value == "off" else "🔔 Daily reminders are back on")
+    else:
+        flip = ("🎙 Voice replies again", "vo:auto") if value == "off" else ("🔇 Text only", "vo:off")
+        await q.answer("🔇 Text only from now on" if value == "off" else "🎙 Voice question = voice reply")
+    kb = [r for r in (q.message.reply_markup.inline_keyboard if q.message.reply_markup else [])
+          if not any((b.callback_data or "").startswith(f"{kind}:") for b in r)]
+    await q.edit_message_reply_markup(InlineKeyboardMarkup(kb + [[InlineKeyboardButton(flip[0], callback_data=flip[1])]]))
 
 
 # ---------- on-request extras: on-screen text, hidden resources, attachments ----------
@@ -1105,10 +1178,10 @@ async def handle_words(msg, context, text, reply_save=None, by_voice=False):
         row = save_id and await asyncio.to_thread(db.get, save_id)
         if not row:
             await msg.reply_text("I couldn't tell which save you mean. Reply to that save (or the link you shared) and say it again.")
-        elif a == "delete":
-            await msg.reply_text(f"Delete this save?\n“{row[4]}”", reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
-                InlineKeyboardButton("✖ Cancel", callback_data=f"kk:{save_id}")]]))
+        elif a == "delete":  # one step, with Undo (no "are you sure?")
+            title = await asyncio.to_thread(db.soft_delete, save_id)
+            await msg.reply_text(f"🗑 Deleted “{title or row[4]}”", reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩ Undo", callback_data=f"u:{save_id}")]]))
         elif a == "worked":
             await asyncio.to_thread(db.mark_proven, save_id)
             await msg.reply_text(f"✅ Nice! Marked “{row[4]}” as proven by you. "
@@ -1388,7 +1461,8 @@ async def daily_tip(context: ContextTypes.DEFAULT_TYPE):
         i, created, stype, url, title, topic, summary, points = row
         best = "\n".join(f"• {p}" for p in (points or [])[:3])
         text = f"💡 Remember this? (you saved it on {created:%d %b})\n\n{title}\n\n{best}"
-        await context.bot.send_message(OWNER, _short(text), reply_markup=_details_button(i),
+        kb = _details_button(i).inline_keyboard + ((InlineKeyboardButton("🔕 Pause reminders", callback_data="rem:off"),),)
+        await context.bot.send_message(OWNER, _short(text), reply_markup=InlineKeyboardMarkup(kb),
                                        disable_web_page_preview=True)
     except Exception:
         log.exception("daily tip failed")
@@ -1436,6 +1510,7 @@ async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
     try:
         await asyncio.to_thread(db.ping)
         log.info("daily database ping ok")
+        await asyncio.to_thread(db.purge_deleted)
         n = await asyncio.to_thread(memory.index_missing)
         if n:
             log.info("indexed %s saves that had no search chunks", n)
@@ -1492,6 +1567,9 @@ def build_app():
     app.add_handler(MessageHandler(me & filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(CallbackQueryHandler(on_details, pattern=r"^d:\d+$"))
     app.add_handler(CallbackQueryHandler(on_delete, pattern=r"^(x|xx|k|kk):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_undo, pattern=r"^u:\d+$"))
+    app.add_handler(CallbackQueryHandler(on_save_button, pattern=r"^(m|wk|aq):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_setting_button, pattern=r"^(rem|vo):\w+$"))
     app.add_handler(CallbackQueryHandler(on_save_or_ask, pattern=r"^(sv|ak):\d+$"))
     app.add_handler(CallbackQueryHandler(on_topic, pattern=r"^t:"))
     app.add_handler(MessageHandler(~me, ignore_strangers))

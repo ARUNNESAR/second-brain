@@ -74,7 +74,7 @@ def add(source_type, source_url, title, topic, summary, key_points, content, emb
 def topics():
     with _connect() as c:
         return [r[0] for r in c.execute(
-            "select topic from saves where topic is not null group by topic order by count(*) desc limit 30")]
+            "select topic from saves where topic is not null and status <> 'deleted' group by topic order by count(*) desc limit 30")]
 
 
 def pending():
@@ -94,7 +94,7 @@ def update_note(save_id, title, topic, summary, key_points, content, embedding):
 
 def find_url(url):
     with _connect() as c:
-        return c.execute("select id, title, status from saves where source_url = %s order by status = 'done' desc limit 1", (url,)).fetchone()
+        return c.execute("select id, title, status from saves where source_url = %s and status <> 'deleted' order by status = 'done' desc limit 1", (url,)).fetchone()
 
 
 def search(embedding, limit=6):
@@ -103,7 +103,7 @@ def search(embedding, limit=6):
         return c.execute(
             """select id, created_at, source_type, source_url, title, topic, summary, key_points, content,
                       1 - (embedding <=> %s) as score
-               from saves where embedding is not null
+               from saves where embedding is not null and status = 'done'
                order by embedding <=> %s limit %s""",
             (Vector(embedding), Vector(embedding), limit),
         ).fetchall()
@@ -113,7 +113,7 @@ def get(save_id):
     with _connect() as c:
         return c.execute(
             """select id, created_at, source_type, source_url, title, topic, summary, key_points, content
-               from saves where id = %s""", (save_id,)).fetchone()
+               from saves where id = %s and status <> 'deleted'""", (save_id,)).fetchone()
 
 
 def since(days):
@@ -137,7 +137,7 @@ def random_older(days):
 def recent(limit=10):
     with _connect() as c:
         return c.execute(
-            "select id, created_at, source_type, title, topic, status from saves order by created_at desc limit %s",
+            "select id, created_at, source_type, title, topic, status from saves where status <> 'deleted' order by created_at desc limit %s",
             (limit,),
         ).fetchall()
 
@@ -146,7 +146,7 @@ def all_saves():
     with _connect() as c:
         return c.execute(
             """select id, created_at, source_type, source_url, title, topic, summary, key_points, content, status
-               from saves order by created_at"""
+               from saves where status <> 'deleted' order by created_at"""
         ).fetchall()
 
 
@@ -198,14 +198,14 @@ def find(words, embedding, limit=8):
     with _connect() as c:
         rows = c.execute(
             """select id, title, topic, created_at, status from saves
-               where title ilike %s or topic ilike %s or source_url ilike %s
+               where (title ilike %s or topic ilike %s or source_url ilike %s) and status <> 'deleted'
                order by created_at desc limit %s""", (_like(words),) * 3 + (limit,)).fetchall()
         seen = {r[0] for r in rows}
         if len(rows) < limit:
             # meaning matches only when one clearly stands out (nonsense words score ~0.62 against everything)
             more = c.execute(
                 """select id, title, topic, created_at, status, 1 - (embedding <=> %s) as score from saves
-                   where embedding is not null order by embedding <=> %s limit %s""",
+                   where embedding is not null and status = 'done' order by embedding <=> %s limit %s""",
                 (_vec(embedding), _vec(embedding), limit)).fetchall()
             if more and more[0][5] >= 0.65:
                 bar = max(0.62, more[0][5] - 0.05)
@@ -222,7 +222,7 @@ def topic_counts():
 def by_topic(topic, limit=15):
     with _connect() as c:
         # topic may be cut short (Telegram buttons hold 64 bytes), so match it as a prefix
-        return c.execute("""select id, title, topic, created_at, status from saves where topic like %s
+        return c.execute("""select id, title, topic, created_at, status from saves where topic like %s and status <> 'deleted'
                             order by created_at desc limit %s""", (_like(topic)[1:], limit)).fetchall()
 
 
@@ -230,7 +230,7 @@ def similar(embedding, exclude_id, threshold=0.9):
     """An existing save that means almost the same thing (likely a duplicate), or None."""
     with _connect() as c:
         return c.execute(
-            """select id, title from saves where id <> %s and embedding is not null
+            """select id, title from saves where id <> %s and embedding is not null and status = 'done'
                and 1 - (embedding <=> %s) > %s order by embedding <=> %s limit 1""",
             (exclude_id, _vec(embedding), threshold, _vec(embedding))).fetchone()
 
@@ -462,7 +462,27 @@ def all_for_backup():
     with _connect() as c:
         return c.execute(
             """select id, created_at, source_type, source_url, title, topic, summary, key_points, content, status,
-                      embedding from saves order by id""").fetchall()
+                      embedding from saves where status <> 'deleted' order by id""").fetchall()
+
+
+def soft_delete(save_id):
+    """One-tap delete: hidden right away, kept for a day so Undo works, then removed for good (purge_deleted)."""
+    with _connect() as c:
+        r = c.execute("""update saves set status = 'deleted', deleted_at = now() where id = %s and status <> 'deleted'
+                         returning title""", (save_id,)).fetchone()
+        return r[0] if r else None
+
+
+def restore(save_id):
+    with _connect() as c:
+        r = c.execute("""update saves set status = case when embedding is null then 'pending' else 'done' end,
+                         deleted_at = null where id = %s and status = 'deleted' returning title""", (save_id,)).fetchone()
+        return r[0] if r else None
+
+
+def purge_deleted():
+    with _connect() as c:
+        return c.execute("delete from saves where status = 'deleted' and deleted_at < now() - interval '1 day'").rowcount
 
 
 def delete(save_id):

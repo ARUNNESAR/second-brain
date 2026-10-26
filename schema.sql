@@ -77,3 +77,6 @@ create table if not exists playbooks (
     save_count int,
     updated_at timestamptz not null default now()
 );
+
+-- One-tap delete with Undo: deleted saves are hidden first, removed for good a day later
+alter table saves add column if not exists deleted_at timestamptz;
