@@ -665,7 +665,7 @@ OTHER_VOICE = "Charon"     # the other person in practice mode: a different, cle
 
 def spoken_version(text, limit=900):
     """Turn a chat answer into something nice to listen to: no sources, links, [1] marks, emoji or bullets."""
-    text = re.split(r"\n\s*Sources:", text)[0]
+    text = re.split(r"\n\s*(?:Sources:|📚 From your saves:)", text)[0]
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"\[\d+\]|#\d+", "", text)
     text = re.sub(r"[*_`#>•]|[\U0001F300-\U0001FAFF☀-➿]", "", text)

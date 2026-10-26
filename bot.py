@@ -42,22 +42,30 @@ OWNER = int(os.environ["TELEGRAM_USER_ID"].strip())
 URL_RE = re.compile(r"https?://\S+")
 MAX_MSG = 4000
 
-HELP = """Your Second Brain 🧠 — everything you learned, there when you need it.
+HELP = """🧠 What I can do (just talk to me, no commands)
 
-SAVE: share any reel, video or post (YouTube, Instagram, X, LinkedIn, Reddit), or send screenshots, a voice note,
-a PDF, or forward a message. I react 👀 while reading and 👌 when it's saved.
+📥 Remember things
+Share a reel, video or post, or send a screenshot, voice note or PDF. 👀 = reading, 👌 = saved.
 
-ASK: just talk to me, by text or voice. Describe your situation, e.g. "client says we're too expensive". Your saved
-mentors answer. Tap 👎 if an answer isn't good enough.
+💬 Help you in the moment
+Tell me your situation, e.g. "a client says we're too expensive". I answer from what you saved.
+Not helpful? Tap 👎 and I'll try again.
 
-Just say it, no commands needed:
-• "practice negotiating my salary": I play the other person and coach you
-• "make my sales playbook": all your sales saves become one guide
-• "what did I save about pricing", "show my latest saves"
-• "delete the last one", "that tip worked for me", "get the screen text from this" (reply to a save)
-• "pause reminders", "remember: always ask the budget first"
+🎭 Practice
+"practice asking for a raise": I play the other person and coach you, then give you a score.
 
-Reply to any save (your shared link too) to ask about it, or send the DM link/screenshot to add it there."""
+📘 Playbooks
+"make my sales playbook": everything you saved on a topic, turned into one clear guide.
+
+🔎 Find & tidy up
+"what did I save about pricing", "show my latest saves", "delete the last one".
+Reply to anything you shared to ask about it, or to add more to it.
+
+🎙 Voice
+Send a voice note to ask. I'll answer by voice too.
+
+⚙️ Settings, in plain words
+"pause reminders", "voice replies off", "remember that I'm a startup founder"."""
 
 
 def _short(text, limit=MAX_MSG):
@@ -67,12 +75,13 @@ def _short(text, limit=MAX_MSG):
 def _friendly_error(e):
     s = str(e)
     if "429" in s or "RESOURCE_EXHAUSTED" in s:
-        return "Gemini's free limit is used up for now. Try again in a minute (or tomorrow if it keeps happening)."
+        return ("I've used up my free thinking for today. Try again tomorrow, or ask in Claude/ChatGPT with "
+                "Second Brain switched on.")
     if "503" in s or "UNAVAILABLE" in s or "overloaded" in s.lower():
         return "Gemini is busy right now. Try again in a minute."
     if isinstance(e, social.Blocked):
         return f"⚠️ {s}"
-    return f"Something went wrong: {s[:200]}"
+    return "Something went wrong on my side. Please try again in a minute."
 
 
 VIDEO_KINDS = {"youtube", "instagram", "x", "linkedin", "reddit"}  # links we can open again for extras
@@ -93,13 +102,15 @@ def _saved_reply(save_id, note, prefix="✅ Saved", kind=None):
 
 
 def _details_button(save_id):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("📖 Details", callback_data=f"d:{save_id}"),
+    return InlineKeyboardMarkup([[InlineKeyboardButton("📖 Read note", callback_data=f"d:{save_id}"),
                                   InlineKeyboardButton("🗑 Delete", callback_data=f"x:{save_id}")]])
 
 
 def _details_text(row):
     i, created, stype, url, title, topic, summary, points, _ = row
-    lines = [f"#{i} {title} · {topic or '-'} · {created:%d %b}", "", summary or ""]
+    where = {"youtube": "YouTube", "instagram": "Instagram", "x": "X", "linkedin": "LinkedIn", "reddit": "Reddit",
+             "image": "Screenshot", "note": "Your note", "voice": "Your voice note", "pdf": "PDF", "video": "Video"}.get(stype, "Saved")
+    lines = [f"📖 {title}", f"{where} · {topic or 'general'} · saved {created:%d %b}", "", summary or ""]
     lines += [f"• {p}" for p in points or []]
     if url:
         lines += ["", url]
@@ -136,6 +147,8 @@ async def _saved_quietly(save_id, note, msg_id, reply_to=None, warning=""):
     """Saved: 👌 on his message, and only speak if something needs his attention (a likely duplicate)."""
     await asyncio.to_thread(db.set_tg_msg, save_id, msg_id)
     await _react(msg_id, "👌")
+    await _tip_once("saved", "👌 Saved! From now on, when you share something: 👀 means I'm reading it, 👌 means it's "
+                            "saved. No need to wait, keep sharing.", msg_id)
     dup = _similar.pop(save_id, None)
     if dup and _bot:
         await _bot.send_message(OWNER, f"👌 Saved #{save_id}, but it looks like #{dup[0]} {dup[1]}. "
@@ -169,8 +182,62 @@ async def _index(save_id):
 
 # ---------- handlers ----------
 
+WELCOME = """🧠 Hi! I'm your Second Brain.
+
+1️⃣ Share anything useful with me: a reel, video, post, screenshot or voice note. I'll remember it.
+2️⃣ When you need help, just tell me your situation, by text or voice. I'll answer using everything you saved.
+
+That's it. Try one of these:"""
+
+
+def _welcome_buttons():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔎 What have I saved?", callback_data="ex:recent"),
+         InlineKeyboardButton("📚 My topics", callback_data="ex:topics")],
+        [InlineKeyboardButton("🎭 Practice a conversation", callback_data="ex:practice"),
+         InlineKeyboardButton("📘 Make a playbook", callback_data="ex:playbook")],
+        [InlineKeyboardButton("❓ Everything I can do", callback_data="ex:help")]])
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP)
+    await update.message.reply_text(WELCOME, reply_markup=_welcome_buttons())
+
+
+_awaiting = {}  # what the next message means, e.g. {"practice": True} after tapping "Practice a conversation"
+
+
+async def on_example(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The welcome buttons: show instead of tell."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    what = q.data.split(":")[1]
+    u = _Upd(q.message)
+    if what == "recent":
+        await cmd_recent(u, _Ctx(context))
+    elif what == "topics":
+        await cmd_topics(u, _Ctx(context))
+    elif what == "practice":
+        _awaiting["practice"] = True
+        await q.message.reply_text("🎭 What do you want to practice? Just describe it, e.g.\n"
+                                   "• asking my boss for a raise\n• telling a client our price is going up\n"
+                                   "• a job interview for a product role")
+    elif what == "playbook":
+        await make_playbook(q.message, "")
+    else:
+        await q.message.reply_text(HELP)
+
+
+async def _tip_once(key, text, reply_to_id=None):
+    """A short tip the FIRST time he meets a feature, never again. Teaches by doing, no guide needed."""
+    if not _bot or await asyncio.to_thread(db.get_setting, f"tip_{key}", ""):
+        return
+    await asyncio.to_thread(db.set_setting, f"tip_{key}", "shown")
+    try:
+        await _bot.send_message(OWNER, text, reply_to_message_id=reply_to_id, allow_sending_without_reply=True)
+    except Exception:
+        log.debug("tip %s not sent", key)
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -185,8 +252,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # a reply to a message that is about ONE save: one of the bot's save messages, or his own shared link/screenshot
     reply_save = None
     if replied and replied.from_user and replied.from_user.is_bot:
-        m = SCOPED_RE.match(replied.text or "")
-        reply_save = int(m.group(1)) if m else None
+        reply_save = _scope_of(replied)
     elif replied:
         reply_save = await asyncio.to_thread(db.by_tg_msg, replied.message_id)
     if reply_save:
@@ -194,6 +260,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await attach_to(msg, reply_save, text=re.sub(r"^add:?\s*", "", text, flags=re.I))  # DM link / text
         else:
             await handle_words(msg, context, text, reply_save=reply_save)  # "screen text", "worked", a question…
+        return
+    if _awaiting.pop("practice", None) and not urls:  # he tapped "Practice a conversation": this is the situation
+        await start_practice(msg, text)
         return
     if _practice.get("active") and not urls:  # in a practice session, every message is his next line
         if text.lower().strip(" .!") in ("stop", "end", "done", "finish", "end practice", "stop practice"):
@@ -218,6 +287,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("❓ Ask it", callback_data=f"ak:{msg.message_id}")]]))
     else:
         await handle_words(msg, context, text)  # plain words: a question, or a request like "delete the last one"
+
+
+def _scope_of(m):
+    """The one save a bot message is about: from "#12" in its text, or from its buttons (📖/🗑 carry the save id)."""
+    hit = SCOPED_RE.match(m.text or "")
+    if hit:
+        return int(hit.group(1))
+    ids = {int(x.group(2)) for row in (m.reply_markup.inline_keyboard if m.reply_markup else []) for b in row
+           if (x := re.match(r"^(d|x|st|rs):(\d+)$", b.callback_data or ""))}
+    return ids.pop() if len(ids) == 1 else None
 
 
 # bot messages that are about ONE save: replying to them asks about that save
@@ -249,10 +328,10 @@ async def on_save_or_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, mid = q.data.split(":")
     text = _texts.pop(int(mid), None)
     if not text:
-        await q.edit_message_text("I lost that text (the bot restarted). Please send it again.")
+        await q.edit_message_text("Sorry, I lost track of that one. Please send it again.")
         return
     if action == "sv":
-        await q.edit_message_text("💾 Saving it (watch for 👌 on your message).")
+        await q.edit_message_text("💾 Saving it. You'll see 👌 on your message when it's done.")
         await save_text(q.message, text, react_id=int(mid))
     else:
         await q.edit_message_reply_markup(None)
@@ -267,7 +346,7 @@ MAX_TG_FILE = 20 * 1024 * 1024  # Telegram lets bots download files up to 20 MB
 async def _save_files(reply_to, tg_files, kind, caption, label, react_id=None):
     """Download Telegram files, let Gemini read them together, save one note."""
     if any((f.file_size or 0) > MAX_TG_FILE for f, _ in tg_files):
-        await reply_to.reply_text("That file is over 20 MB, which Telegram doesn't let bots download. "
+        await reply_to.reply_text("That file is too big for me to open. "
                                   "Share the link instead (YouTube/Instagram/X…).")
         return
     react_id = react_id or reply_to.message_id
@@ -319,7 +398,7 @@ async def on_voice_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, mid = q.data.split(":")
     pending = _voices.pop(int(mid), None)
     if not pending:
-        await q.edit_message_text("I lost that voice note (the bot restarted). Please send it again.")
+        await q.edit_message_text("Sorry, I lost track of that voice note. Please send it again.")
         return
     f, mime = pending
     if action == "vs":
@@ -327,7 +406,7 @@ async def on_voice_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _save_files(q.message, [(f, mime)], "voice", "", "voice note", react_id=int(mid))
         return
     if (f.file_size or 0) > MAX_TG_FILE:
-        await q.edit_message_text("That voice note is too long for me to download. Try a shorter one.")
+        await q.edit_message_text("That voice note is too long for me. Try a shorter one (under a few minutes).")
         return
     await q.edit_message_text("🎙 Listening…")
     try:
@@ -463,6 +542,8 @@ async def _queue_failed(bot, save_id, url, e):
         await explain("😢 I couldn't save this after several tries. Send a screenshot of it instead.")
     elif status:
         await _react(msg_id, "🤔")  # blocked for now; it retries by itself and turns 👌 when saved
+        await _tip_once("blocked", "🤔 means that site is blocking me for a while. I'll keep trying by myself and it "
+                                     "turns 👌 when it's saved. Nothing for you to do.", msg_id)
 
 
 async def save_youtube(update, context, url, caption):
@@ -503,7 +584,7 @@ async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     src = msg.photo[-1] if msg.photo else msg.document
     if (src.file_size or 0) > MAX_TG_FILE:
-        await msg.reply_text("That image is over 20 MB, which Telegram doesn't let bots download. Send a smaller screenshot.")
+        await msg.reply_text("That image is too big for me to open. Send a normal screenshot instead.")
         return
     await _react(msg.message_id, "👀")
     try:
@@ -547,7 +628,7 @@ async def _answer(question, only_id=None, previous=None, rows=None):
             rows = [tuple(row) + (1.0,)] if row else []
             if not rows:
                 _last_qa["id"] = None
-                return f"Save #{only_id} doesn't exist anymore.", None, []
+                return "That save was deleted, so I can't answer from it.", None, []
         elif rows is None:
             # a short follow-up ("why?", "tell me more") is searched together with the previous question
             query = f"{_last_qa['q']} {question}" if history and len(question) < 60 else question
@@ -562,17 +643,17 @@ async def _answer(question, only_id=None, previous=None, rows=None):
         sources = []
         for n in cited:
             r = rows[n - 1]
-            line = f"[{n}] #{r[0]} {r[4]} · {r[1]:%d %b}"
+            line = f"[{n}] {r[4]} ({r[1]:%d %b})"
             if r[3]:
-                line += f"\n{r[3]}"
+                line += f"\n     {r[3]}"
             sources.append(line)
-        return _short(text + ("\n\nSources:\n" + "\n".join(sources) if sources else "")), None, rows
+        return _short(text + ("\n\n📚 From your saves:\n" + "\n".join(sources) if sources else "")), None, rows
     except Exception as e:
         log.exception("ask failed")
         s = str(e)
         if rows and ("429" in s or "RESOURCE_EXHAUSTED" in s):
             # Gemini's free limit is used up: still show the saves that match, so the answer isn't lost
-            return ("Gemini's free limit is used up for today, so I can't write an answer.\n"
+            return ("I've used up my free thinking for today, so I can't write an answer.\n"
                     "These saves match your question. Tap to read:"), _list_markup([(r[0], r[4]) for r in rows[:5]]), rows
         return _friendly_error(e), None, rows or []
 
@@ -583,8 +664,8 @@ _clarify = {}    # clarifying-question message_id -> original question
 
 
 def _rate_buttons(mid):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("👍", callback_data=f"up:{mid}"),
-                                  InlineKeyboardButton("👎 Try harder", callback_data=f"dn:{mid}")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("👍 Helpful", callback_data=f"up:{mid}"),
+                                  InlineKeyboardButton("👎 Not helpful", callback_data=f"dn:{mid}")]])
 
 
 async def respond(reply_to, question, only_id=None, ask_first=True, by_voice=False):
@@ -620,6 +701,11 @@ async def _send_answer(status, question, only_id=None, previous=None, rows=None,
     await status.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
     if used and markup is not None and await _want_voice(by_voice):
         asyncio.create_task(_voice_answer(question, text, status.message_id))
+        await _tip_once("voice", "🎙 You asked by voice, so I'll answer by voice too. Say \"voice replies off\" if you "
+                                   "prefer text, or \"always reply by voice\".")
+    elif used and markup is not None:
+        await _tip_once("answer", "Tip: if an answer misses the mark, tap 👎 and I'll try again. To ask about one "
+                                    "thing you saved, reply to the link you shared and ask.")
 
 
 # ---------- voice replies: asked by voice → answered by voice (Puck); "always by voice" / "voice off" ----------
@@ -668,7 +754,7 @@ async def on_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _, mid, choice = q.data.split(":")
     pending = _clarify.pop(int(mid), None)
     if not pending:
-        await q.edit_message_text("I lost that question (the bot restarted). Please ask again.")
+        await q.edit_message_text("Sorry, I lost track of that one. Please ask again.")
         return
     question = pending["q"]
     if choice != "x":
@@ -694,12 +780,12 @@ async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer("Trying harder…")
     await q.edit_message_reply_markup(None)
-    status = await q.message.reply_text("🔎 Searching wider and thinking harder…")
+    status = await q.message.reply_text("🔎 Sorry about that. Looking again, more carefully…")
     await _send_answer(status, info["q"], info["only_id"], previous=info["text"])
 
 def _list_markup(rows):
     """One row of buttons per save: 📖 #id title  |  🗑"""
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"📖 #{i} {(title or '(untitled)')[:35]}", callback_data=f"d:{i}"),
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"📖 {(title or 'Untitled')[:40]}", callback_data=f"d:{i}"),
                                   InlineKeyboardButton("🗑", callback_data=f"x:{i}")]
                                  for i, title, *_ in rows])
 
@@ -707,14 +793,14 @@ def _list_markup(rows):
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words = " ".join(context.args).strip()
     if not words:
-        await update.message.reply_text("Type a few words you remember, like:\n/find cold calling")
+        await update.message.reply_text("What should I look for? Just say e.g. \"what did I save about cold calling\".")
         return
     vec = await asyncio.to_thread(brain.embed, words, True)
     rows = await asyncio.to_thread(db.find, words, vec, 8)
     if not rows:
-        await update.message.reply_text(f"Nothing found for \"{words}\". Try other words, or /topics.")
+        await update.message.reply_text(f"I didn't find anything about \"{words}\". Try other words, or say \"show my topics\".")
         return
-    await update.message.reply_text(f"🔎 Saves matching \"{words}\":", reply_markup=_list_markup(rows))
+    await update.message.reply_text(f"🔎 Here's what you saved about \"{words}\". Tap one to read it:", reply_markup=_list_markup(rows))
 
 
 def _fit_bytes(text, limit):
@@ -739,7 +825,7 @@ async def on_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     topic = q.data[2:]
     rows = await asyncio.to_thread(db.by_topic, topic, 15)
-    await q.message.reply_text(f"📚 {topic}: latest {len(rows)}", reply_markup=_list_markup(rows))
+    await q.message.reply_text(f"📚 Your {topic} saves. Tap one to read it:", reply_markup=_list_markup(rows))
 
 
 async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -747,12 +833,10 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("Nothing saved yet.")
         return
-    icons = {"youtube": "▶️", "image": "🖼", "note": "📝", "link": "🔗", "instagram": "📸", "x": "𝕏", "linkedin": "💼", "reddit": "👽"}
-    lines = [f"#{i} {icons.get(t, '•')} {title or '(untitled)'}"
-             + (f" · {topic}" if topic else "") + {"pending": " (in queue)", "failed": " (failed)", "kept": " (link only)"}.get(st, "")
-             + f" · {created:%d %b}"
+    mark = {"pending": "⏳ ", "failed": "😢 ", "kept": "🔗 "}
+    items = [(i, mark.get(st, "") + (title if st == "done" else "still saving…" if st == "pending" else title or "a link"))
              for i, created, t, title, topic, st in rows]
-    await update.message.reply_text(_short("Your last saves:\n\n" + "\n".join(lines)), disable_web_page_preview=True)
+    await update.message.reply_text("🕘 Your latest saves. Tap one to read it:", reply_markup=_list_markup(items))
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -778,10 +862,10 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = (context.args[0] if context.args else "").lstrip("#")
     if not arg.isdigit():
-        await update.message.reply_text("Tell me which one, like: /delete 12  (numbers are in /recent)")
+        await update.message.reply_text("Which one? Reply to that save and say \"delete\", or say \"delete the last one\".")
         return
     gone = await asyncio.to_thread(db.delete, int(arg))
-    await update.message.reply_text(f"🗑 Deleted #{arg}: {gone[0]}" if gone else f"No save #{arg} found.")
+    await update.message.reply_text(f"🗑 Deleted “{gone[0]}”" if gone else "I couldn't find that save.")
 
 
 async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -793,13 +877,13 @@ async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_id, text = int(args[0].lstrip("#")), " ".join(args[1:])
     row = await asyncio.to_thread(db.add_correction, save_id, text)
     if not row:
-        await update.message.reply_text(f"No save #{save_id} found.")
+        await update.message.reply_text("I couldn't find that save.")
         return
     title, topic, summary, points = row
     vec = await asyncio.to_thread(brain.embed, f"{title}\nTopic: {topic}\n{summary}\n" + "\n".join(points))
     await asyncio.to_thread(db.set_embedding, save_id, vec)
     await _index(save_id)
-    await update.message.reply_text(f"✏️ Fixed #{save_id}: {title}\nYour correction is now part of the note.")
+    await update.message.reply_text(f"✏️ Fixed “{title}”. Your correction is now part of the note.")
 
 
 async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -807,7 +891,7 @@ async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not n:
         await update.message.reply_text("Nothing to retry. 👍")
         return
-    await update.message.reply_text(f"🔁 Retrying {n} link(s) in the background. I'll message you as each one saves.")
+    await update.message.reply_text(f"🔁 Trying {n} link(s) again. You'll see 👌 on each one when it's saved.")
     _kick_queue(context)
 
 
@@ -824,7 +908,8 @@ async def on_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     row = await asyncio.to_thread(db.get, int(q.data.split(":")[1]))
     if row:
-        await q.message.reply_text(_details_text(row), disable_web_page_preview=True)
+        await q.message.reply_text(_details_text(row), disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🗑 Delete", callback_data=f"x:{row[0]}")]]))  # replying to it = about this save
     else:
         await q.message.reply_text("That save was deleted.")
 
@@ -838,10 +923,10 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_id = int(sid)
     await q.answer()
     kb = q.message.reply_markup.inline_keyboard if q.message.reply_markup else []
-    in_list = bool(kb) and kb[0][0].text.startswith("📖 #")  # rows from /find or /topics
+    in_list = len(kb) > 1 or (bool(kb) and len(kb[0]) == 2 and kb[0][1].text == "🗑")  # a list of saves
     if action == "x" and in_list:  # from a /find or /topics list: confirm in a separate message, keep the list
         row = await asyncio.to_thread(db.get, save_id)
-        await q.message.reply_text(f"Delete #{save_id}: {row[4] if row else '?'}?", reply_markup=InlineKeyboardMarkup([[
+        await q.message.reply_text(f"Delete this save?\n“{row[4] if row else '?'}”", reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
             InlineKeyboardButton("✖ Cancel", callback_data=f"kk:{save_id}")]]))
     elif action == "x":
@@ -851,10 +936,10 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "k":
         await q.edit_message_reply_markup(_details_button(save_id))
     elif action == "kk":
-        await q.edit_message_text(f"Kept #{save_id} 👍")
+        await q.edit_message_text("Okay, kept it 👍")
     else:
         gone = await asyncio.to_thread(db.delete, save_id)
-        await q.edit_message_text(f"🗑 Deleted #{save_id}" + (f": {gone[0]}" if gone else " (it was already gone)"))
+        await q.edit_message_text(f"🗑 Deleted “{gone[0]}”" if gone else "🗑 That one was already deleted.")
 
 
 # ---------- on-request extras: on-screen text, hidden resources, attachments ----------
@@ -875,7 +960,7 @@ async def screen_text_for(save_id):
     """Re-open a saved video/post and keep every on-screen text block word for word. Returns a message."""
     row = await asyncio.to_thread(db.get, save_id)
     if not row:
-        return f"#{save_id} doesn't exist anymore."
+        return "That save was deleted."
     stype, url = row[2], row[3]
     if stype == "youtube":
         text = await asyncio.to_thread(brain.screen_text_youtube, url)
@@ -899,7 +984,7 @@ async def resource_for(save_id):
     """Find the 'comment X and I'll DM you…' resource: links in the post, a web search, or the to-get list."""
     row = await asyncio.to_thread(db.get, save_id)
     if not row:
-        return f"#{save_id} doesn't exist anymore."
+        return "That save was deleted."
     _, _, stype, url, title, _, summary, points, content = row
     offer = await asyncio.to_thread(brain.find_offer, title, "", f"{summary}\n" + "\n".join(points or []) + f"\n{content or ''}")
     if not offer.has_offer and not offer.urls:
@@ -929,7 +1014,7 @@ async def on_extra_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action, sid = q.data.split(":")
     save_id = int(sid)
     label = "on-screen text" if action == "st" else "resource"
-    status = await q.message.reply_text(f"⏳ Looking for the {label} in #{save_id}… (up to a minute)")
+    status = await q.message.reply_text(f"⏳ Looking for the {label}… (up to a minute)")
     try:
         text = await (screen_text_for(save_id) if action == "st" else resource_for(save_id))
         await status.edit_text(_short(text), disable_web_page_preview=True)
@@ -940,7 +1025,7 @@ async def on_extra_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def attach_to(reply_to, save_id, text=None, image=None):
     """Arun replied to a save with a link / forwarded DM / screenshot: add it to that save."""
-    status = await reply_to.reply_text(f"⏳ Adding it to #{save_id}…")
+    status = await reply_to.reply_text("⏳ Adding it to that save…")
     try:
         if image:
             data, mime = image
@@ -950,11 +1035,11 @@ async def attach_to(reply_to, save_id, text=None, image=None):
         updated = await asyncio.to_thread(db.append_extra, save_id, "Added by Arun", text,
                                           "📎 Added: " + " ".join(text.split())[:120])
         if not updated:
-            await status.edit_text(f"#{save_id} doesn't exist anymore.")
+            await status.edit_text("That save was deleted.")
             return
         await _reembed(updated)
         done = await asyncio.to_thread(db.finish_toget, save_id)
-        await status.edit_text(f"📎 Added to #{save_id}: {updated[1]}" + ("\n✅ Ticked off your /toget list." if done else ""))
+        await status.edit_text(f"📎 Added to “{updated[1]}”" + ("\n✅ Ticked off your /toget list." if done else ""))
     except Exception as e:
         log.exception("attach failed for #%s", save_id)
         await status.edit_text(_friendly_error(e))
@@ -1019,14 +1104,14 @@ async def handle_words(msg, context, text, reply_save=None, by_voice=False):
         save_id = await _resolve(intent.target, reply_save)
         row = save_id and await asyncio.to_thread(db.get, save_id)
         if not row:
-            await msg.reply_text("I couldn't tell which save you mean. Reply to it, or say its number like #12.")
+            await msg.reply_text("I couldn't tell which save you mean. Reply to that save (or the link you shared) and say it again.")
         elif a == "delete":
-            await msg.reply_text(f"Delete #{save_id}: {row[4]}?", reply_markup=InlineKeyboardMarkup([[
+            await msg.reply_text(f"Delete this save?\n“{row[4]}”", reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
                 InlineKeyboardButton("✖ Cancel", callback_data=f"kk:{save_id}")]]))
         elif a == "worked":
             await asyncio.to_thread(db.mark_proven, save_id)
-            await msg.reply_text(f"✅ Nice! Marked #{save_id} {row[4]} as proven by you. "
+            await msg.reply_text(f"✅ Nice! Marked “{row[4]}” as proven by you. "
                                  f"It now comes first in answers and playbooks.")
         else:
             status = await msg.reply_text("⏳ On it… (up to a minute)")
@@ -1074,7 +1159,7 @@ PRACTICE_IDLE = 30 * 60  # a session left alone for 30 minutes ends by itself
 
 
 def _end_button():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🏁 End & get feedback", callback_data="pe:0")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏁 Finish & score me", callback_data="pe:0")]])
 
 
 async def start_practice(msg, situation):
@@ -1082,7 +1167,7 @@ async def start_practice(msg, situation):
         await msg.reply_text("What do you want to practice? e.g. \"practice asking my boss for a raise\" or "
                              "\"rehearse a price negotiation with a client\".")
         return
-    status = await msg.reply_text("🎭 Setting up the scene with your mentors' advice…")
+    status = await msg.reply_text("🎭 Setting up your practice…")
     try:
         rows = await asyncio.to_thread(memory.search, situation, 6)
         notes = brain.notes_for(rows)
@@ -1123,7 +1208,7 @@ async def practice_reply(msg, text, by_voice=False):
 
 async def end_practice(msg):
     if not _practice.get("active"):
-        await msg.reply_text("There's no practice running. Say \"practice <situation>\" to start one.")
+        await msg.reply_text("There's no practice going on. Say e.g. \"practice asking my boss for a raise\" to start one.")
         return
     status = await msg.reply_text("🏁 Scoring your practice…")
     try:
@@ -1157,12 +1242,13 @@ async def make_playbook(msg, topic):
     if not topic:
         have = await asyncio.to_thread(db.list_playbooks)
         topics = await asyncio.to_thread(db.topic_counts)
-        lines = ["📘 Which playbook? Say e.g. \"make my sales playbook\"."]
-        if have:
-            lines.append("\nYou already have: " + ", ".join(t for t, *_ in have))
-        if topics:
-            lines.append("\nYour topics: " + ", ".join(f"{t} ({n})" for t, n in topics[:12]))
-        await msg.reply_text("\n".join(lines))
+        names = list(dict.fromkeys([t for t, *_ in have] + [t for t, n in topics if n >= 3]))[:10]
+        if not names:
+            await msg.reply_text("📘 Save a few more things on one topic first (3 or more), then I can turn them into a playbook.")
+            return
+        buttons = [InlineKeyboardButton(f"📘 {n.title()}", callback_data="pb:" + _fit_bytes(n, 60)) for n in names]
+        await msg.reply_text("📘 Which topic should I turn into one clear guide?",
+                             reply_markup=InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)]))
         return
     status = await msg.reply_text(f"📘 Writing your {topic} playbook from everything you saved… (about a minute)")
     try:
@@ -1185,6 +1271,15 @@ async def make_playbook(msg, topic):
     except Exception as e:
         log.exception("playbook failed")
         await status.edit_text(_friendly_error(e))
+
+
+async def on_playbook_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    await q.edit_message_reply_markup(None)
+    await make_playbook(q.message, q.data[3:])
 
 
 async def cmd_playbook(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1264,11 +1359,11 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buf = io.BytesIO(content)
         buf.name = f"second-brain-backup-{dt.datetime.now(IST):%Y-%m-%d}.json.gz"
         await update.message.reply_document(buf, caption=f"🗄 Backup file: {total} saves.")
-        await status.edit_text(f"✅ GitHub backup done: {n[0]} new/changed, {n[1]} removed, {n[2]} saves in total." if n is not None else
+        await status.edit_text(f"✅ Backed up. All {n[2]} saves are safe." if n is not None else
                                "✅ Backup file below. (GitHub backup isn't set up yet.)")
     except Exception as e:
         log.exception("manual backup failed")
-        await status.edit_text(f"❌ Backup failed: {str(e)[:200]}")
+        await status.edit_text("❌ The backup didn't work this time. I'll try again tonight automatically.")
 
 
 async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1292,7 +1387,7 @@ async def daily_tip(context: ContextTypes.DEFAULT_TYPE):
             return
         i, created, stype, url, title, topic, summary, points = row
         best = "\n".join(f"• {p}" for p in (points or [])[:3])
-        text = f"💡 Remember this? #{i} (saved {created:%d %b})\n\n{title}\n\n{best}"
+        text = f"💡 Remember this? (you saved it on {created:%d %b})\n\n{title}\n\n{best}"
         await context.bot.send_message(OWNER, _short(text), reply_markup=_details_button(i),
                                        disable_web_page_preview=True)
     except Exception:
@@ -1383,6 +1478,8 @@ def build_app():
     app.add_handler(CommandHandler("practice", cmd_practice, filters=me))
     app.add_handler(CommandHandler("playbook", cmd_playbook, filters=me))
     app.add_handler(CallbackQueryHandler(on_practice_end, pattern=r"^pe:0$"))
+    app.add_handler(CallbackQueryHandler(on_example, pattern=r"^ex:\w+$"))
+    app.add_handler(CallbackQueryHandler(on_playbook_pick, pattern=r"^pb:"))
     app.add_handler(CommandHandler("memtest", cmd_memtest, filters=me))
     app.add_handler(CallbackQueryHandler(on_extra_button, pattern=r"^(st|rs):\d+$"))
     app.add_handler(CallbackQueryHandler(on_clarify, pattern=r"^cl:\d+:(\d+|x)$"))
