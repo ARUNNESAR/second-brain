@@ -10,3 +10,4 @@ starlette==1.9.0
 yt-dlp==2026.8.19
 psycopg_pool==3.3.3
 lameenc==1.9.0
+imageio-ffmpeg==0.6.0

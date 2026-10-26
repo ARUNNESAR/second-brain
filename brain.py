@@ -659,7 +659,7 @@ def build_playbook(topic, rows, profile=""):
 # (Google can share free quotas within one account), keeping his reel voice quota for reels.
 TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-3.8-flash-tts",
               "gemini-3.8-flash-lite-tts"]
-MENTOR_VOICE = "Puck"      # his chosen voice: young man, mid-twenties, slow relaxed pace
+MENTOR_VOICE = "Achird"    # natural, friendly everyday voice (Puck is his REELS voice; too performed for this)
 OTHER_VOICE = "Charon"     # the other person in practice mode: a different, clearly separate voice
 
 
@@ -701,33 +701,48 @@ def voice_script(question, answer_text):
     return spoken_version(answer_text)  # fallback: the written answer, cleaned up
 
 
-VOICE_STYLE = ("Speak this as a warm, relaxed voice note to a close friend: a young man in his mid-twenties, slow and "
-               "natural pace, real pauses at the '...', a little smile in the voice, never like reading an article")
+# Plain and natural, NOT the reels delivery (he found that exaggerated for everyday answers).
+VOICE_STYLE = ("Say this plainly and naturally, like an ordinary voice message to a friend: normal everyday tone, "
+               "steady relaxed pace, no dramatic emphasis, no acting, no announcer voice")
+NATURAL_VOICES = {"Achird": "friendly", "Umbriel": "easy-going", "Zubenelgenubi": "casual"}
 
 
-def speak(text, voice=MENTOR_VOICE, style=VOICE_STYLE):
-    """Text → MP3 bytes (Telegram plays MP3 as a voice note). Needs no ffmpeg."""
+def _tts_pcm(text, voice, style):
+    """Gemini text-to-speech → (raw 16-bit mono PCM, sample rate)."""
     import io as _io
     import wave
-    import lameenc
     resp = _generate(contents=f"{style}:\n\n{text}", models=TTS_MODELS, config=types.GenerateContentConfig(
         response_modalities=["AUDIO"], speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
             prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)))))
     blob = resp.candidates[0].content.parts[0].inline_data
-    data, rate = blob.data, 24000
     if "wav" in (blob.mime_type or ""):
-        with wave.open(_io.BytesIO(data)) as w:
-            rate, data = w.getframerate(), w.readframes(w.getnframes())
-    else:
-        m = re.search(r"rate=(\d+)", blob.mime_type or "")
-        rate = int(m.group(1)) if m else rate
+        with wave.open(_io.BytesIO(blob.data)) as w:
+            return w.readframes(w.getnframes()), w.getframerate()
+    m = re.search(r"rate=(\d+)", blob.mime_type or "")
+    return blob.data, int(m.group(1)) if m else 24000
+
+
+def speak(text, voice=None, style=VOICE_STYLE):
+    """Text → (audio bytes, format). 'ogg' = Telegram's own voice-note format (OGG/Opus, plays inline like a normal
+    voice message); 'mp3' only as a fallback if the converter isn't available."""
+    import subprocess
+    pcm, rate = _tts_pcm(text, voice or os.environ.get("VOICE_NAME") or MENTOR_VOICE, style)
+    try:
+        import imageio_ffmpeg  # a bundled ffmpeg, so the server needs nothing extra installed
+        out = subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-loglevel", "error", "-f", "s16le", "-ar", str(rate),
+                              "-ac", "1", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "32k", "-f", "ogg", "pipe:1"],
+                             input=pcm, capture_output=True, timeout=60, check=True).stdout
+        if out[:4] == b"OggS":
+            return out, "ogg"
+    except Exception:
+        pass
+    import lameenc
     enc = lameenc.Encoder()
     enc.set_bit_rate(48)
     enc.set_in_sample_rate(rate)
     enc.set_channels(1)
     enc.set_quality(2)
-    return bytes(enc.encode(data) + enc.flush())
-
+    return bytes(enc.encode(pcm) + enc.flush()), "mp3"
 
 def transcribe(audio_bytes, mime):
     """What Arun said in a voice note (to answer it as a question)."""

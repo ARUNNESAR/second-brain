@@ -640,13 +640,17 @@ async def _send_voice(text, reply_to_id, voice=None, style=None):
     if not (_bot and text.strip()):
         return
     try:
-        kw = {"voice": voice} if voice else {}
-        if style:
-            kw["style"] = style
-        mp3 = await asyncio.to_thread(brain.speak, text, **kw)
-        buf = io.BytesIO(mp3)
-        buf.name = "reply.mp3"
-        await _bot.send_voice(OWNER, voice=buf, reply_to_message_id=reply_to_id, allow_sending_without_reply=True)
+        voice = voice or await asyncio.to_thread(db.get_setting, "voice_name", "") or brain.MENTOR_VOICE
+        kw = {"style": style} if style else {}
+        audio, fmt = await asyncio.to_thread(brain.speak, text, voice, **kw)
+        buf = io.BytesIO(audio)
+        if fmt == "ogg":  # Telegram's own voice-note format: plays inline like any voice message
+            buf.name = "reply.ogg"
+            await _bot.send_voice(OWNER, voice=buf, reply_to_message_id=reply_to_id, allow_sending_without_reply=True)
+        else:  # fallback: a normal audio file with a player (always downloadable)
+            buf.name = "reply.mp3"
+            await _bot.send_audio(OWNER, audio=buf, title="Second Brain", reply_to_message_id=reply_to_id,
+                                  allow_sending_without_reply=True)
     except Exception:
         log.exception("voice reply failed (text answer was sent)")
 
