@@ -659,7 +659,7 @@ def build_playbook(topic, rows, profile=""):
 # (Google can share free quotas within one account), keeping his reel voice quota for reels.
 TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-3.8-flash-tts",
               "gemini-3.8-flash-lite-tts"]
-MENTOR_VOICE = "Achird"    # natural, friendly everyday voice (Puck is his REELS voice; too performed for this)
+MENTOR_VOICE = "Zubenelgenubi"  # his pick (Oct 27): casual, natural everyday voice. Puck is for his REELS only.
 OTHER_VOICE = "Charon"     # the other person in practice mode: a different, clearly separate voice
 
 
