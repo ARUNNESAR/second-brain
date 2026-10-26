@@ -64,3 +64,16 @@ create table if not exists feedback (
     helpful    boolean,
     save_ids   bigint[]
 );
+
+-- Silent capture: which of Arun's Telegram messages each save came from (so a reply to it means "this save")
+alter table saves add column if not exists tg_msg_id bigint;
+-- "This worked for me": proven tips rank higher and are marked in answers and playbooks
+alter table saves add column if not exists proven boolean not null default false;
+
+-- Living playbooks: one synthesized guide per topic, rebuilt on request
+create table if not exists playbooks (
+    topic      text primary key,
+    text       text not null,
+    save_count int,
+    updated_at timestamptz not null default now()
+);

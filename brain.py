@@ -520,6 +520,138 @@ def clarify_check(question, profile, titles):
     return c
 
 
+# ---------- "Just talk": understand plain-language requests ----------
+
+class Intent(BaseModel):
+    action: str    # one of ACTIONS
+    target: str    # which save: "last", "#12", or words describing it ("the one about cold calling"); else ""
+    text: str      # the payload: the question, the note to save, search words, profile text, topic, on/off…
+
+
+ACTIONS = {
+    "ask": "a question or a situation he needs advice/help with (THE DEFAULT when unsure)",
+    "save_note": "he wants to remember/save a thought or tip he typed (\"remember that…\", \"note: …\", \"save this…\")",
+    "delete": "delete/remove a save",
+    "find": "find/show/list saves about something (\"what did I save about pricing\", \"show my negotiation saves\")",
+    "recent": "show the latest saves",
+    "topics": "show topics / what kinds of things he saved",
+    "reminders": "turn daily reminders on or off (text = on/off)",
+    "profile": "tell the bot who he is / update his background (text = the description)",
+    "recap": "a recap/summary of the last week",
+    "practice": "rehearse / role-play / practice a conversation or situation (text = the situation)",
+    "playbook": "make/show/update a playbook or guide for a topic (text = the topic)",
+    "worked": "a tip/save WORKED for him in real life (target = which one)",
+    "screen_text": "get the text/prompt shown on screen in a saved video (target = which one)",
+    "resource": "get the resource/link a creator offers (comment-for-link) (target = which one)",
+    "backup": "make a backup now",
+    "export": "download/export everything",
+    "help": "how to use the bot / what can you do",
+}
+
+
+def classify(message):
+    """What does Arun want? Plain words instead of commands."""
+    resp = _generate(
+        contents=f"Arun's message to his second-brain bot:\n{message}",
+        config=types.GenerateContentConfig(
+            system_instruction="Pick the action he wants. Actions:\n" +
+                               "\n".join(f"- {k}: {v}" for k, v in ACTIONS.items()) +
+                               "\nIf it's a question, a problem, or a situation, it is 'ask' (keep his full words in "
+                               "text). Use 'ask' whenever unsure.",
+            response_mime_type="application/json", response_schema=Intent),
+        models=SAVE_MODELS)
+    i = resp.parsed if resp.parsed else Intent(**json.loads(resp.text or '{"action":"ask","target":"","text":""}'))
+    if i.action not in ACTIONS:
+        i.action = "ask"
+    return i
+
+
+# ---------- Practice mode: rehearse a real conversation with the mentors coaching ----------
+
+PRACTICE_RULES = """You are running a practice session for Arun. Situation he wants to rehearse: {situation}
+About Arun: {profile}
+
+You play TWO roles in every reply:
+1. THE OTHER PERSON in the situation (client, boss, interviewer, colleague…). Be realistic: push back, raise real
+   objections, don't make it easy, but stay fair. 1-3 sentences, in character, in quotes.
+2. THE COACH, after a line break, starting with "💡 Coach:" — talking TO Arun as "you": one or two short sentences on how
+   his last line landed and his best next move, using what his saved mentors teach (notes below; cite like [2]).
+   Praise what was good. Only comment on what he actually said.
+On the very first turn (no messages from Arun yet), open the scene in character, then a one-line coach tip TO Arun for
+how to open (e.g. "💡 Coach: Lead with the news, don't apologise [3].").
+Plain text, no markdown.
+
+His saved mentors' advice for this situation:
+{notes}"""
+
+DEBRIEF_RULES = """The practice session below is over. Give Arun a short debrief, talking to him as "you". Judge ONLY the lines
+marked ARUN; never claim he did something he didn't say. If he only said a line or two, say the session was short and
+focus on how to continue:
+- Score: X/10 and one line why.
+- What you did well (1-2 bullets).
+- Fix next time (2-3 bullets), each with the better line to say, based on his mentors' advice [cite].
+- Your best lines to use for real (2-3 exact sentences).
+Plain text, no markdown, under 180 words.
+
+Situation: {situation}
+His mentors' advice:
+{notes}"""
+
+
+def notes_for(rows, limit=6, chars=1500):
+    return "\n\n".join(f"[{i}] {r[4]}: {r[6]}\n- " + "\n- ".join(r[7] or []) + (f"\n{r[8][:chars]}" if r[8] else "")
+                       for i, r in enumerate(rows[:limit], 1))
+
+
+def practice_turn(situation, notes, history, profile=""):
+    """history: list of ("arun"|"bot", text). Returns the bot's next turn (other person + coach)."""
+    convo = "\n".join(f"{'ARUN' if who == 'arun' else 'YOU'}: {t}" for who, t in history) or "(not started yet)"
+    resp = _generate(contents=f"Conversation so far:\n{convo}\n\nYour next turn:",
+                     config=types.GenerateContentConfig(system_instruction=PRACTICE_RULES.format(
+                         situation=situation, profile=profile or "unknown", notes=notes)))
+    return (resp.text or "").strip()
+
+
+def practice_debrief(situation, notes, history):
+    convo = "\n".join(f"{'ARUN' if who == 'arun' else 'OTHER/COACH'}: {t}" for who, t in history)
+    resp = _generate(contents=convo, config=types.GenerateContentConfig(
+        system_instruction=DEBRIEF_RULES.format(situation=situation, notes=notes)))
+    return (resp.text or "").strip()
+
+
+# ---------- Living playbooks ----------
+
+PLAYBOOK_RULES = """Write "Arun's {topic} Playbook": ONE clean, practical guide built from the saved notes below
+(advice from creators he trusts). It replaces re-watching 20 videos.
+
+Structure:
+- Title line, then a 2-line "The core idea" summary.
+- Sections by real situation (e.g. "When a client says it's too expensive", "Before the call"), 4-8 sections.
+  In each: the moves, steps, numbers and exact lines to say, merged from all notes that help, each with its source like
+  (#21). No repetition across sections.
+- When creators DISAGREE, never blend or pick: write "⚖️ Two schools of thought:" with each side, its source, and WHEN
+  each one fits (type of client, stage, goal). End with "👉 Your situation decides."
+- {proven_rule}
+- Finish with "Top 5 rules" (one line each).
+Use markdown headings (##) and bullets. Only use what the notes say; mark anything else as "My take:"."""
+
+
+def build_playbook(topic, rows, profile=""):
+    blocks = []
+    for r in rows:
+        sid, created, stype, url, title, t, summary, points, content, proven = r
+        blocks.append(f"(#{sid}) {title}{' — PROVEN by Arun' if proven else ''} [{t}]\n{summary}\n- " +
+                      "\n- ".join(points or []) + (f"\n{content[:2500]}" if content else ""))
+    resp = _generate(contents=(f"About Arun: {profile}\n\n" if profile else "") + "Saved notes:\n\n" + "\n\n".join(blocks),
+                     config=types.GenerateContentConfig(system_instruction=PLAYBOOK_RULES.format(
+                         topic=topic.title(), proven_rule=(
+                             "Notes whose header ends with '— PROVEN by Arun' are tips he tried and that worked: mark ONLY "
+                             "those with '✅ proven by you' and put them first in their section." if any(r[9] for r in rows) else
+                             "None of these tips is proven by Arun yet: never write 'proven by you' or a ✅ mark.")),
+                         max_output_tokens=12000))
+    return (resp.text or "").strip()
+
+
 def transcribe(audio_bytes, mime):
     """What Arun said in a voice note (to answer it as a question)."""
     resp = _generate(contents=[types.Part.from_bytes(data=audio_bytes, mime_type=mime),

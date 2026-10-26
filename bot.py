@@ -42,26 +42,22 @@ OWNER = int(os.environ["TELEGRAM_USER_ID"].strip())
 URL_RE = re.compile(r"https?://\S+")
 MAX_MSG = 4000
 
-HELP = """Your Second Brain 🧠
+HELP = """Your Second Brain 🧠 — everything you learned, there when you need it.
 
-SAVE: share a YouTube video, Instagram reel, or an X, LinkedIn or Reddit post. Or send screenshots, a voice note, a video file or a PDF. Forwarded messages get saved too.
-NOTE: /note <text> saves your own thought.
-ASK: type your situation or question (or send a voice note and tap Ask), e.g. "client says we're too expensive". I may ask one quick question first. Tap 👎 on an answer to make me try harder.
+SAVE: share any reel, video or post (YouTube, Instagram, X, LinkedIn, Reddit), or send screenshots, a voice note,
+a PDF, or forward a message. I react 👀 while reading and 👌 when it's saved.
 
-/find <words>  find a save (to read or delete it)
-/topics  browse saves by topic
-/recent  last 10 saves
-/export  download everything as a file
-/fix <number> <correction>  correct a note that got something wrong
-/delete <number>  remove a save
-/retry  try again on links that failed
-/me  tell me about yourself so answers fit you
-/memtest  check how well I remember your saves
-/recap  recap of the last 7 days (it also comes by itself every Sunday 9 AM)
+ASK: just talk to me, by text or voice. Describe your situation, e.g. "client says we're too expensive". Your saved
+mentors answer. Tap 👎 if an answer isn't good enough.
 
-Every other morning at 9 AM you get one old save to remember (/reminders off to pause).
-Reply to any "✅ Saved #12" message with a question to ask about that save only, or with a link / forwarded DM / screenshot to ADD it to that save.
-On videos: tap 📝 Screen text (copies prompts shown on screen) or 🎁 Get resource (finds "comment X and I'll DM you" links). Or type full with the link to do both. /toget lists what you still need to collect."""
+Just say it, no commands needed:
+• "practice negotiating my salary": I play the other person and coach you
+• "make my sales playbook": all your sales saves become one guide
+• "what did I save about pricing", "show my latest saves"
+• "delete the last one", "that tip worked for me", "get the screen text from this" (reply to a save)
+• "pause reminders", "remember: always ask the budget first"
+
+Reply to any save (your shared link too) to ask about it, or send the DM link/screenshot to add it there."""
 
 
 def _short(text, limit=MAX_MSG):
@@ -122,6 +118,31 @@ def _make_note(url, kind, caption):
 _similar = {}  # new save id -> (id, title) of an existing save that says almost the same thing
 
 
+# ---------- silent capture: emoji reactions on Arun's own message instead of chatty replies ----------
+# 👀 reading it · 👌 saved · 🤔 blocked for now, will retry by itself · 😢 couldn't save (a message explains)
+_bot = None  # set when the app starts (post_init), so background jobs can react too
+
+
+async def _react(msg_id, emoji):
+    if not (_bot and msg_id):
+        return
+    try:
+        await _bot.set_message_reaction(chat_id=OWNER, message_id=msg_id, reaction=emoji)
+    except Exception:
+        log.debug("couldn't set reaction %s on %s", emoji, msg_id)
+
+
+async def _saved_quietly(save_id, note, msg_id, reply_to=None, warning=""):
+    """Saved: 👌 on his message, and only speak if something needs his attention (a likely duplicate)."""
+    await asyncio.to_thread(db.set_tg_msg, save_id, msg_id)
+    await _react(msg_id, "👌")
+    dup = _similar.pop(save_id, None)
+    if dup and _bot:
+        await _bot.send_message(OWNER, f"👌 Saved #{save_id}, but it looks like #{dup[0]} {dup[1]}. "
+                                       f"Say \"delete #{save_id}\" if it's a repeat.",
+                                reply_to_message_id=msg_id, allow_sending_without_reply=True)
+
+
 async def _store(note, source_type, url, pending_id=None):
     vec = await asyncio.to_thread(brain.embed, brain.note_text_for_search(note))
     if pending_id:  # this link failed before: fill in the same save number
@@ -161,15 +182,25 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pending = _clarify.pop(replied.message_id)
         await respond(msg, pending["q"] + f"\n(More detail from Arun: {text})", ask_first=False)
         return
+    # a reply to a message that is about ONE save: one of the bot's save messages, or his own shared link/screenshot
+    reply_save = None
     if replied and replied.from_user and replied.from_user.is_bot:
         m = SCOPED_RE.match(replied.text or "")
-        if m:  # a reply to one of the bot's messages about ONE save
-            save_id = int(m.group(1))
-            if urls or msg.forward_origin or text.lower().startswith("add"):
-                await attach_to(msg, save_id, text=re.sub(r"^add:?\s*", "", text, flags=re.I))  # DM link / text
-            else:
-                await ask(update, text, only_id=save_id)  # a question about that save
-            return
+        reply_save = int(m.group(1)) if m else None
+    elif replied:
+        reply_save = await asyncio.to_thread(db.by_tg_msg, replied.message_id)
+    if reply_save:
+        if urls or msg.forward_origin or text.lower().startswith("add"):
+            await attach_to(msg, reply_save, text=re.sub(r"^add:?\s*", "", text, flags=re.I))  # DM link / text
+        else:
+            await handle_words(msg, context, text, reply_save=reply_save)  # "screen text", "worked", a question…
+        return
+    if _practice.get("active") and not urls:  # in a practice session, every message is his next line
+        if text.lower().strip(" .!") in ("stop", "end", "done", "finish", "end practice", "stop practice"):
+            await end_practice(msg)
+        else:
+            await practice_reply(msg, text)
+        return
     if urls:  # every link in the message gets saved, not just the first
         caption = URL_RE.sub("", text).strip()
         for u in urls:
@@ -186,7 +217,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("💾 Save it", callback_data=f"sv:{msg.message_id}"),
             InlineKeyboardButton("❓ Ask it", callback_data=f"ak:{msg.message_id}")]]))
     else:
-        await ask(update, text)
+        await handle_words(msg, context, text)  # plain words: a question, or a request like "delete the last one"
 
 
 # bot messages that are about ONE save: replying to them asks about that save
@@ -195,17 +226,19 @@ SCOPED_RE = re.compile(r"^(?:✅ Saved|🔁 Saved later|📥 Got it|💡 Remembe
 _texts = {}  # message_id -> long text waiting for the Save/Ask choice
 
 
-async def save_text(reply_to, text):
-    status = await reply_to.reply_text("⏳ Saving…")
+async def save_text(reply_to, text, react_id=None):
+    """Save a typed/forwarded note quietly: 👀 then 👌 on his message."""
+    react_id = react_id or reply_to.message_id
+    await _react(react_id, "👀")
     try:
         topics = await asyncio.to_thread(db.topics)
         note = await asyncio.to_thread(brain.note_from_text, text, topics)
         save_id = await _store(note, "note", None)
-        t, markup = _saved_reply(save_id, note)
-        await status.edit_text(t, reply_markup=markup)
+        await _saved_quietly(save_id, note, react_id)
     except Exception as e:
         log.exception("text save failed")
-        await status.edit_text(_friendly_error(e))
+        await _react(react_id, "😢")
+        await reply_to.reply_text(_friendly_error(e))
 
 
 async def on_save_or_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -218,10 +251,11 @@ async def on_save_or_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await q.edit_message_text("I lost that text (the bot restarted). Please send it again.")
         return
-    await q.edit_message_reply_markup(None)
     if action == "sv":
-        await save_text(q.message, text)
+        await q.edit_message_text("💾 Saving it (watch for 👌 on your message).")
+        await save_text(q.message, text, react_id=int(mid))
     else:
+        await q.edit_message_reply_markup(None)
         await respond(q.message, text)
 
 
@@ -230,13 +264,14 @@ async def on_save_or_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 MAX_TG_FILE = 20 * 1024 * 1024  # Telegram lets bots download files up to 20 MB
 
 
-async def _save_files(reply_to, tg_files, kind, caption, label):
+async def _save_files(reply_to, tg_files, kind, caption, label, react_id=None):
     """Download Telegram files, let Gemini read them together, save one note."""
     if any((f.file_size or 0) > MAX_TG_FILE for f, _ in tg_files):
         await reply_to.reply_text("That file is over 20 MB, which Telegram doesn't let bots download. "
                                   "Share the link instead (YouTube/Instagram/X…).")
         return
-    status = await reply_to.reply_text(f"⏳ Reading the {label}…")
+    react_id = react_id or reply_to.message_id
+    await _react(react_id, "👀")
     post = social.Post(url=None, kind=kind, text=caption, workdir=social._workdir())
     try:
         for n, (f, mime) in enumerate(tg_files):
@@ -246,11 +281,11 @@ async def _save_files(reply_to, tg_files, kind, caption, label):
         topics = await asyncio.to_thread(db.topics)
         note = await asyncio.to_thread(brain.note_from_post, post, topics, "")
         save_id = await _store(note, kind, None)
-        t, markup = _saved_reply(save_id, note)
-        await status.edit_text(t, reply_markup=markup)
+        await _saved_quietly(save_id, note, react_id)
     except Exception as e:
         log.exception("%s save failed", kind)
-        await status.edit_text(_friendly_error(e) + f"\nPlease send the {label} again.")
+        await _react(react_id, "😢")
+        await reply_to.reply_text(_friendly_error(e) + f"\nPlease send the {label} again.")
     finally:
         post.cleanup()
 
@@ -258,6 +293,12 @@ async def _save_files(reply_to, tg_files, kind, caption, label):
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     f = msg.voice or msg.audio
+    if msg.voice and _practice.get("active") and (f.file_size or 0) <= MAX_TG_FILE:  # practice: his spoken line
+        data = bytes(await (await f.get_file()).download_as_bytearray())
+        said = await asyncio.to_thread(brain.transcribe, data, f.mime_type or "audio/ogg")
+        await msg.reply_text(f"🎙 {said}")
+        await practice_reply(msg, said)
+        return
     if msg.voice and not msg.forward_origin:  # his own voice note: could be an idea to save OR a question
         _voices[msg.message_id] = (f, f.mime_type or "audio/ogg")
         await msg.reply_text("🎙 Ask this as a question, or save it?", reply_markup=InlineKeyboardMarkup([[
@@ -283,7 +324,7 @@ async def on_voice_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f, mime = pending
     if action == "vs":
         await q.edit_message_text("💾 Saving your voice note…")
-        await _save_files(q.message, [(f, mime)], "voice", "", "voice note")
+        await _save_files(q.message, [(f, mime)], "voice", "", "voice note", react_id=int(mid))
         return
     if (f.file_size or 0) > MAX_TG_FILE:
         await q.edit_message_text("That voice note is too long for me to download. Try a shorter one.")
@@ -296,8 +337,8 @@ async def on_voice_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("voice question failed")
         await q.edit_message_text(_friendly_error(e))
         return
-    await q.edit_message_text(f"🎙 You asked: {question}")
-    await respond(q.message, question)
+    await q.edit_message_text(f"🎙 You said: {question}")
+    await handle_words(q.message, context, question)  # a question, or a request like "delete the last one"
 
 
 async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,20 +367,19 @@ async def flush_album(context: ContextTypes.DEFAULT_TYPE):
 
 async def _save_url(update, context, url, clean, kind, caption):
     """Links go into a queue and are saved in the background, one at a time (so Instagram doesn't block us).
-    The '📥 In queue' message is later edited into '✅ Saved'."""
+    Silent: 👀 on his message now, 👌 when it's saved. No chat messages unless something needs him."""
+    msg_id = update.message.message_id
     found = await asyncio.to_thread(db.find_url, clean)
     if found and found[2] == "done":
-        await update.message.reply_text(f"Already saved as #{found[0]}: {found[1]}")
+        await _react(msg_id, "👌")  # already saved earlier: nothing to do
         return
     if found:  # it failed or is still waiting: move it to the front
         save_id = found[0]
         await asyncio.to_thread(db.retry_one, save_id)
     else:
         save_id = await asyncio.to_thread(db.add, kind, clean, clean, None, None, None, caption, None, "pending")
-    waiting = await asyncio.to_thread(db.queue_size)
-    msg = await update.message.reply_text(
-        f"📥 Got it #{save_id}" + (f" ({waiting} in queue)" if waiting > 1 else "") + ". Saving in the background…")
-    _queue_msgs[save_id] = (msg.chat_id, msg.message_id)
+    await asyncio.to_thread(db.set_tg_msg, save_id, msg_id)
+    await _react(msg_id, "👀")
     _kick_queue(context)
 
 
@@ -386,14 +426,11 @@ async def process_queue(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     log.exception("queue: couldn't record failure of #%s", save_id)
             else:
-                # Saved. A problem telling Arun must not undo the save.
+                # Saved: 👌 on his message. A problem signalling it must not undo the save.
                 try:
-                    text, markup = _saved_reply(save_id, note, kind=kind)
-                    if warning:
-                        text += "\n(only the caption/text could be read)"
-                    await _tell(context.bot, save_id, text, markup)
+                    await _saved_quietly(save_id, note, await asyncio.to_thread(db.tg_msg_of, save_id))
                 except Exception:
-                    log.exception("queue: saved #%s but couldn't send the message", save_id)
+                    log.exception("queue: saved #%s but couldn't signal it", save_id)
                 if FULL_RE.search(caption or ""):  # Arun typed "full" with the link: do the extras right away
                     for extra in (screen_text_for, resource_for):
                         try:
@@ -406,23 +443,26 @@ async def process_queue(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _queue_failed(bot, save_id, url, e):
+    """🤔 on his message while it waits for a retry; 😢 + a short reply only when it finally can't be saved."""
     s = str(e)
+    msg_id = await asyncio.to_thread(db.tg_msg_of, save_id)
+
+    async def explain(text):
+        await _react(msg_id, "😢")
+        await bot.send_message(OWNER, text, reply_to_message_id=msg_id, allow_sending_without_reply=True,
+                               disable_web_page_preview=True)
+
     if isinstance(e, social.Gone) or "Video unavailable" in s or "Private video" in s:
         # deleted / private / empty: retrying won't help, say so now
         await asyncio.to_thread(db.set_status, save_id, "failed")
-        await _tell(bot, save_id, f"❌ #{save_id} can't be read: it looks deleted or private.\n"
-                                  f"{url}\nSend a screenshot of it if you still have it.")
+        await explain("😢 I can't read this one: it looks deleted or private. Send a screenshot of it instead.")
         return
     wait = 120 if isinstance(e, social.Blocked) else 60 if ("429" in s or "RESOURCE_EXHAUSTED" in s) else 30
     status = await asyncio.to_thread(db.postpone, save_id, wait)
-    if status is None:  # deleted while it was being processed
-        _queue_msgs.pop(save_id, None)
-    elif status == "failed":
-        await _tell(bot, save_id, f"❌ Couldn't save #{save_id} after several tries.\n{url}\n"
-                                  f"Send a screenshot of it instead.")
-    elif save_id in _queue_msgs:  # first failure: tell once, quietly
-        await _tell(bot, save_id, f"⏳ #{save_id} is blocked for now. I'll retry by myself and "
-                                  f"message you when it's saved.")
+    if status == "failed":
+        await explain("😢 I couldn't save this after several tries. Send a screenshot of it instead.")
+    elif status:
+        await _react(msg_id, "🤔")  # blocked for now; it retries by itself and turns 👌 when saved
 
 
 async def save_youtube(update, context, url, caption):
@@ -446,6 +486,9 @@ async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     replied = msg.reply_to_message
     m = SCOPED_RE.match(replied.text or "") if replied and replied.from_user and replied.from_user.is_bot else None
+    if replied and not m and not msg.media_group_id:  # a reply to his own shared link/screenshot
+        sid = await asyncio.to_thread(db.by_tg_msg, replied.message_id)
+        m = re.match(r"(\d+)", str(sid)) if sid else None
     if m and not msg.media_group_id:  # a screenshot (e.g. of the DM) sent as a reply to a save: add it there
         src = msg.photo[-1] if msg.photo else msg.document
         if (src.file_size or 0) <= MAX_TG_FILE:
@@ -462,35 +505,26 @@ async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (src.file_size or 0) > MAX_TG_FILE:
         await msg.reply_text("That image is over 20 MB, which Telegram doesn't let bots download. Send a smaller screenshot.")
         return
-    status = await msg.reply_text("⏳ Reading the screenshot…")
+    await _react(msg.message_id, "👀")
     try:
         mime = "image/jpeg" if msg.photo else msg.document.mime_type
         data = bytes(await (await src.get_file()).download_as_bytearray())
         topics = await asyncio.to_thread(db.topics)
         note = await asyncio.to_thread(brain.note_from_image, data, mime, topics, (msg.caption or "").strip())
         save_id = await _store(note, "image", None)
-        text, markup = _saved_reply(save_id, note)
-        await status.edit_text(text, reply_markup=markup)
+        await _saved_quietly(save_id, note, msg.message_id)
     except Exception as e:
         log.exception("image save failed")
-        await status.edit_text(_friendly_error(e) + "\nPlease send the screenshot again.")
+        await _react(msg.message_id, "😢")
+        await msg.reply_text(_friendly_error(e) + "\nPlease send the screenshot again.")
 
 
 async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args).strip()
     if not text:
-        await update.message.reply_text("Write it after the command, like:\n/note Always ask the client's budget first")
+        await update.message.reply_text("Just type it, like: remember: always ask the client's budget first")
         return
-    status = await update.message.reply_text("⏳ Saving your note…")
-    try:
-        topics = await asyncio.to_thread(db.topics)
-        note = await asyncio.to_thread(brain.note_from_text, text, topics)
-        save_id = await _store(note, "note", None)
-        text, markup = _saved_reply(save_id, note)
-        await status.edit_text(text, reply_markup=markup)
-    except Exception as e:
-        log.exception("note save failed")
-        await status.edit_text(_friendly_error(e))
+    await save_text(update.message, text)
 
 
 _last_qa = {"at": 0.0, "q": "", "a": "", "id": None}  # previous question + answer (+ save it was about)
@@ -902,6 +936,216 @@ async def cmd_toget(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=_list_markup([(sid, title) for _, sid, _, _, title in rows[:10]]))
 
 
+# ---------- "Just talk": plain words instead of commands ----------
+
+class _Upd:  # lets the old /command handlers run from plain words
+    def __init__(self, msg):
+        self.message = msg
+
+
+class _Ctx:
+    def __init__(self, context, args=()):
+        self.args = list(args)
+        self.job_queue = getattr(context, "job_queue", None)
+        self.bot = getattr(context, "bot", None)
+
+
+async def _resolve(target, reply_save=None):
+    """Which save does he mean? A reply, "#12", "the last one", or words like "the one about cold calling"."""
+    if reply_save:
+        return reply_save
+    t = (target or "").strip().lower()
+    m = re.search(r"#?(\d+)", t)
+    if m and (t.startswith("#") or t.isdigit()):
+        return int(m.group(1))
+    if not t or t in ("last", "the last one", "latest", "last one", "that", "this", "it"):
+        rows = await asyncio.to_thread(db.recent, 1)
+        return rows[0][0] if rows else None
+    rows = await asyncio.to_thread(memory.search, t, 1)
+    return rows[0][0] if rows else None
+
+
+async def handle_words(msg, context, text, reply_save=None):
+    """Understand what he wants from plain words (or a voice note), then do it."""
+    try:
+        intent = await asyncio.to_thread(brain.classify, text)
+    except Exception:
+        log.exception("couldn't classify; treating as a question")
+        intent = brain.Intent(action="ask", target="", text=text)
+    a, payload = intent.action, (intent.text or "").strip()
+    u, c = _Upd(msg), _Ctx(context)
+    log.info("words -> %s", a)
+
+    if a == "ask":
+        await respond(msg, text, only_id=reply_save)
+    elif a == "save_note":
+        await save_text(msg, payload or text)
+    elif a in ("delete", "worked", "screen_text", "resource"):
+        save_id = await _resolve(intent.target, reply_save)
+        row = save_id and await asyncio.to_thread(db.get, save_id)
+        if not row:
+            await msg.reply_text("I couldn't tell which save you mean. Reply to it, or say its number like #12.")
+        elif a == "delete":
+            await msg.reply_text(f"Delete #{save_id}: {row[4]}?", reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes, delete", callback_data=f"xx:{save_id}"),
+                InlineKeyboardButton("✖ Cancel", callback_data=f"kk:{save_id}")]]))
+        elif a == "worked":
+            await asyncio.to_thread(db.mark_proven, save_id)
+            await msg.reply_text(f"✅ Nice! Marked #{save_id} {row[4]} as proven by you. "
+                                 f"It now comes first in answers and playbooks.")
+        else:
+            status = await msg.reply_text("⏳ On it… (up to a minute)")
+            try:
+                out = await (screen_text_for(save_id) if a == "screen_text" else resource_for(save_id))
+                await status.edit_text(_short(out), disable_web_page_preview=True)
+            except Exception as e:
+                log.exception("%s failed", a)
+                await status.edit_text(_friendly_error(e))
+    elif a == "find":
+        await cmd_find(u, _Ctx(context, (payload or text).split()))
+    elif a == "recent":
+        await cmd_recent(u, c)
+    elif a == "topics":
+        await cmd_topics(u, c)
+    elif a == "reminders":
+        await cmd_reminders(u, _Ctx(context, ["off" if "off" in (payload + text).lower() else "on"]))
+    elif a == "profile":
+        await asyncio.to_thread(db.set_setting, "profile", (payload or text)[:2000])
+        await msg.reply_text("✅ Got it. Every answer will now take this into account.")
+    elif a == "recap":
+        await cmd_recap(u, c)
+    elif a == "practice":
+        await start_practice(msg, payload or text)
+    elif a == "playbook":
+        await make_playbook(msg, payload)
+    elif a == "backup":
+        await cmd_backup(u, c)
+    elif a == "export":
+        await cmd_export(u, c)
+    else:
+        await cmd_start(u, c)
+
+
+# ---------- Practice mode: rehearse a real conversation; the mentors coach between lines ----------
+
+_practice = {}  # {"active", "situation", "notes", "history", "at"}
+PRACTICE_IDLE = 30 * 60  # a session left alone for 30 minutes ends by itself
+
+
+def _end_button():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏁 End & get feedback", callback_data="pe:0")]])
+
+
+async def start_practice(msg, situation):
+    if not situation or len(situation) < 8:
+        await msg.reply_text("What do you want to practice? e.g. \"practice asking my boss for a raise\" or "
+                             "\"rehearse a price negotiation with a client\".")
+        return
+    status = await msg.reply_text("🎭 Setting up the scene with your mentors' advice…")
+    try:
+        rows = await asyncio.to_thread(memory.search, situation, 6)
+        notes = brain.notes_for(rows)
+        profile = await asyncio.to_thread(db.get_setting, "profile", "")
+        _practice.clear()
+        _practice.update(active=True, situation=situation, notes=notes, history=[], at=time.time(), profile=profile)
+        first = await asyncio.to_thread(brain.practice_turn, situation, notes, [], profile)
+        _practice["history"].append(("bot", first))
+        await status.edit_text(_short(f"🎭 Practice: {situation}\nReply as yourself (text or voice). "
+                                      f"Say \"stop\" or tap 🏁 when done.\n\n{first}"), reply_markup=_end_button())
+    except Exception as e:
+        log.exception("practice start failed")
+        _practice.clear()
+        await status.edit_text(_friendly_error(e))
+
+
+async def practice_reply(msg, text):
+    if time.time() - _practice.get("at", 0) > PRACTICE_IDLE:
+        _practice.clear()
+        await handle_words(msg, None, text)
+        return
+    _practice["history"].append(("arun", text))
+    _practice["at"] = time.time()
+    status = await msg.reply_text("🎭 …")
+    try:
+        turn = await asyncio.to_thread(brain.practice_turn, _practice["situation"], _practice["notes"],
+                                       _practice["history"], _practice.get("profile", ""))
+        _practice["history"].append(("bot", turn))
+        await status.edit_text(_short(turn), reply_markup=_end_button())
+    except Exception as e:
+        log.exception("practice turn failed")
+        await status.edit_text(_friendly_error(e))
+
+
+async def end_practice(msg):
+    if not _practice.get("active"):
+        await msg.reply_text("There's no practice running. Say \"practice <situation>\" to start one.")
+        return
+    status = await msg.reply_text("🏁 Scoring your practice…")
+    try:
+        out = await asyncio.to_thread(brain.practice_debrief, _practice["situation"], _practice["notes"],
+                                      _practice["history"])
+        await status.edit_text(_short(f"🏁 Practice debrief\n\n{out}"))
+    except Exception as e:
+        log.exception("debrief failed")
+        await status.edit_text(_friendly_error(e))
+    finally:
+        _practice.clear()
+
+
+async def on_practice_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    await q.edit_message_reply_markup(None)
+    await end_practice(q.message)
+
+
+async def cmd_practice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_practice(update.message, " ".join(context.args))
+
+
+# ---------- Living playbooks ----------
+
+async def make_playbook(msg, topic):
+    topic = (topic or "").strip().strip(".").lower()
+    if not topic:
+        have = await asyncio.to_thread(db.list_playbooks)
+        topics = await asyncio.to_thread(db.topic_counts)
+        lines = ["📘 Which playbook? Say e.g. \"make my sales playbook\"."]
+        if have:
+            lines.append("\nYou already have: " + ", ".join(t for t, *_ in have))
+        if topics:
+            lines.append("\nYour topics: " + ", ".join(f"{t} ({n})" for t, n in topics[:12]))
+        await msg.reply_text("\n".join(lines))
+        return
+    status = await msg.reply_text(f"📘 Writing your {topic} playbook from everything you saved… (about a minute)")
+    try:
+        vec = await asyncio.to_thread(brain.embed, topic, True)
+        rows = await asyncio.to_thread(db.playbook_rows, topic, vec)
+        if len(rows) < 3:
+            await status.edit_text(f"You have only {len(rows)} save(s) about {topic}. Save a few more first.")
+            return
+        profile = await asyncio.to_thread(db.get_setting, "profile", "")
+        text = await asyncio.to_thread(brain.build_playbook, topic, rows, profile)
+        await asyncio.to_thread(db.save_playbook, topic, text, len(rows))
+        top = re.search(r"top 5 rules.*", text, re.I | re.S)
+        await status.edit_text(_short(f"📘 Your {topic.title()} Playbook is ready, built from {len(rows)} saves.\n\n" +
+                                      (re.sub(r"[#*]", "", top.group(0)).strip() if top else "") +
+                                      "\n\nThe full playbook is in the file below. Say \"update my "
+                                      f"{topic} playbook\" any time you've saved more."))
+        buf = io.BytesIO(text.encode("utf-8"))
+        buf.name = f"{topic.title()} Playbook.md"
+        await msg.reply_document(buf, caption=f"📘 {topic.title()} Playbook ({len(rows)} saves)")
+    except Exception as e:
+        log.exception("playbook failed")
+        await status.edit_text(_friendly_error(e))
+
+
+async def cmd_playbook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await make_playbook(update.message, " ".join(context.args))
+
+
 # ---------- About Arun + memory test ----------
 
 async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1060,25 +1304,16 @@ async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_menu(app):
-    # Fills the "/" menu in Telegram so commands don't have to be remembered.
+    # Steve Jobs rule: no commands to learn. The menu shows only 4; everything else is plain words (old commands
+    # still work if typed). Also keep the bot handle so background jobs can react with emoji.
+    global _bot
+    _bot = app.bot
     await app.bot.set_my_commands([
-        ("find", "Find a save, e.g. /find cold calling"),
-        ("topics", "Browse saves by topic"),
-        ("recent", "Last 10 saves"),
-        ("note", "Save your own note"),
-        ("export", "Download everything"),
-        ("fix", "Correct a note, e.g. /fix 12 …"),
-        ("delete", "Remove a save, e.g. /delete 12"),
-        ("recap", "Recap of the last 7 days"),
-        ("retry", "Retry saves that failed"),
-        ("reminders", "Turn daily reminders on/off"),
-        ("backup", "Back up all saves now"),
-        ("toget", "Resources still to get (comment-for-link)"),
-        ("me", "Tell me about yourself (tailors answers)"),
-        ("memtest", "Test how well I remember your saves"),
-        ("help", "How to use me"),
+        ("practice", "Rehearse a conversation, e.g. a negotiation"),
+        ("playbook", "Turn your saves on a topic into one guide"),
+        ("me", "Tell me about yourself"),
+        ("help", "What I can do"),
     ])
-
 
 def build_app():
     """The bot with all its handlers. Used by main() on the PC and by server.py online."""
@@ -1100,6 +1335,9 @@ def build_app():
     app.add_handler(CommandHandler("backup", cmd_backup, filters=me))
     app.add_handler(CommandHandler("toget", cmd_toget, filters=me))
     app.add_handler(CommandHandler("me", cmd_me, filters=me))
+    app.add_handler(CommandHandler("practice", cmd_practice, filters=me))
+    app.add_handler(CommandHandler("playbook", cmd_playbook, filters=me))
+    app.add_handler(CallbackQueryHandler(on_practice_end, pattern=r"^pe:0$"))
     app.add_handler(CommandHandler("memtest", cmd_memtest, filters=me))
     app.add_handler(CallbackQueryHandler(on_extra_button, pattern=r"^(st|rs):\d+$"))
     app.add_handler(CallbackQueryHandler(on_clarify, pattern=r"^cl:\d+:(\d+|x)$"))

@@ -86,6 +86,19 @@ async def search_my_brain(query: str, limit: int = 6) -> str:
 
 
 @mcp.tool()
+async def get_playbook(topic: str = "") -> str:
+    """Arun's playbook for a topic (e.g. "sales"): one guide merged from all his saves on it, with his proven tips
+    marked. Leave topic empty to list the playbooks he has."""
+    if not topic.strip():
+        rows = await asyncio.to_thread(db.list_playbooks)
+        return ("Playbooks: " + ", ".join(f"{t} ({n} saves, updated {u:%d %b})" for t, n, u in rows)) if rows else \
+            "No playbooks yet. In Telegram he can say \"make my <topic> playbook\"."
+    row = await asyncio.to_thread(db.get_playbook, topic.strip().lower())
+    return f"{row[1]}\n\n(Built from {row[2]} saves, updated {row[3]:%d %b %Y})" if row else \
+        f"No {topic} playbook yet. Use search_my_brain instead."
+
+
+@mcp.tool()
 async def get_save(save_id: int) -> str:
     """Full details of one save, including the whole transcript / original text. Use the #number from search results."""
     row = await asyncio.to_thread(db.get, save_id)

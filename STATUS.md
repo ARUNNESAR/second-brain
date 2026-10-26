@@ -7,28 +7,20 @@ Phone/laptop → Telegram bot ┐
 ChatGPT / Claude (MCP)      ┼→ Render server (second-brain-xbgr.onrender.com) → Gemini + Supabase memory
 ```
 
-## How to use it
+## How to use it (no commands needed: just talk, by text or voice)
 
 | You want to… | Do this |
 |---|---|
-| Save a YouTube video, Instagram reel, X post or LinkedIn post | Share it to **@arun_brain_bot** in Telegram |
-| Copy prompts/text shown in a video | Tap 📝 Screen text on the save (or type `full` with the link) |
-| Get a "comment X and I'll DM you" resource | Tap 🎁 Get resource. When you get the DM, reply to the save with the link/screenshot. `/toget` = still to collect |
-| A note got something wrong | `/fix 12 the correct thing` |
-| Save screenshots / voice note / video file / PDF | Send it to the bot (several screenshots together = one note) |
-| Forwarded message | Forward it to the bot and it gets saved |
-| Find or delete an old save | `/find words` or `/topics`, then tap 📖 or 🗑 |
-| Save your own thought | `/note …` in the bot |
-| Ask in Telegram | Type your question to the bot (Gemini answers). Follow-ups like `why?` work. |
-| Ask about ONE save | Reply to its `✅ Saved #12` message with your question |
-| Make answers fit you | `/me` + a few lines about yourself |
-| Check it remembers | `/memtest` (also runs by itself every Sunday) |
-| Pause daily reminders | `/reminders off` (`/reminders on` to restart) |
-| Ask in ChatGPT (PC or phone) | New chat → **+** → turn on **Second Brain** → ask (ChatGPT answers from your notes) |
-| See or back up your saves | `/recent`, `/export` in the bot |
-| Daily reminder | One old save every morning 9 AM (Mon-Sat) |
-| Weekly recap | Comes by itself **every Sunday 9 AM** in Telegram. `/recap` gets it any time. |
-
+| Save anything | Share it to **@arun_brain_bot**. It reacts 👀 while reading, 👌 when saved (🤔 = blocked, retries by itself; 😢 = couldn't, it tells you why) |
+| Get help in a situation | Describe it ("client says we're too expensive"). Your saved mentors answer. 👎 = try harder |
+| Rehearse a conversation | "practice asking my boss for a raise" → it plays the other person and coaches you; "stop" for a score |
+| One guide per topic | "make my sales playbook" → one merged guide (also readable by Claude/ChatGPT) |
+| Find / delete / list | "what did I save about pricing", "delete the last one", "show my latest saves" |
+| A tip worked | "that twisted-words tip worked for me" → it's marked ✅ proven and comes first |
+| Ask about one save | Reply to your shared link (or the bot's message) with your question |
+| Add the DM resource | Reply to the save with the link / screenshot you received |
+| About you | /me + a few lines (tailors every answer) |
+| Ask in Claude / ChatGPT | Turn on **Second Brain**; it searches first and can read your playbooks |
 The PC does **not** need to be on anymore. **Don't run `start-bot.bat`.** It's only for offline testing, and two copies of the bot fight over your messages.
 
 ## Where things live

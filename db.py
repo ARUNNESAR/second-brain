@@ -303,6 +303,7 @@ def unindexed_saves():
 
 CHUNK_WEIGHT = 0.98  # a chunk must match about as well as a summary to lift a save (tuned on 66 test questions)
 WORD_BONUS = 0.01    # small boost when the exact words appear (names, tools, terms)
+PROVEN_BONUS = 0.02  # tips Arun tried and marked "worked for me"
 
 
 def hybrid_search(query, embedding, limit=6, pool=60):
@@ -331,6 +332,8 @@ def hybrid_search(query, embedding, limit=6, pool=60):
         score = {sid: max(summary.get(sid, 0), best_chunk.get(sid, 0) * CHUNK_WEIGHT)
                       + (WORD_BONUS if sid in word_text else 0)
                  for sid in set(summary) | set(best_chunk)}
+        for (sid,) in c.execute("select id from saves where proven and id = any(%s)", (list(score),)):
+            score[sid] += PROVEN_BONUS  # tips Arun marked "worked for me" come first
         top = sorted(score, key=score.get, reverse=True)[:limit]
         if not top:
             return []
@@ -389,6 +392,64 @@ def open_toget():
 def finish_toget(save_id):
     with _connect() as c:
         return c.execute("update toget set done = true where save_id = %s and not done", (save_id,)).rowcount
+
+
+def set_tg_msg(save_id, msg_id):
+    with _connect() as c:
+        c.execute("update saves set tg_msg_id = %s where id = %s", (msg_id, save_id))
+
+
+def by_tg_msg(msg_id):
+    with _connect() as c:
+        r = c.execute("select id from saves where tg_msg_id = %s", (msg_id,)).fetchone()
+        return r[0] if r else None
+
+
+def tg_msg_of(save_id):
+    with _connect() as c:
+        r = c.execute("select tg_msg_id from saves where id = %s", (save_id,)).fetchone()
+        return r[0] if r else None
+
+
+def mark_proven(save_id):
+    with _connect() as c:
+        r = c.execute("update saves set proven = true where id = %s returning title", (save_id,)).fetchone()
+        return r[0] if r else None
+
+
+def proven_ids(ids):
+    with _connect() as c:
+        return {r[0] for r in c.execute("select id from saves where proven and id = any(%s)", (list(ids),))}
+
+
+def playbook_rows(topic, embedding, limit=25):
+    """Saves for a topic's playbook: everything tagged with the topic, plus the closest saves by meaning."""
+    v = _vec(embedding)
+    with _connect() as c:
+        return c.execute(
+            """select id, created_at, source_type, source_url, title, topic, summary, key_points, content, proven
+               from saves where status = 'done' and (topic ilike %s or id in (
+                   select id from saves where status = 'done' and embedding is not null
+                   order by embedding <=> %s limit 12))
+               order by proven desc, created_at limit %s""", (f"%{topic}%", v, limit)).fetchall()
+
+
+def save_playbook(topic, text, n):
+    with _connect() as c:
+        c.execute("""insert into playbooks (topic, text, save_count) values (%s, %s, %s)
+                     on conflict (topic) do update set text = excluded.text, save_count = excluded.save_count,
+                     updated_at = now()""", (topic, text, n))
+
+
+def get_playbook(topic):
+    with _connect() as c:
+        return c.execute("select topic, text, save_count, updated_at from playbooks where topic ilike %s",
+                         (topic,)).fetchone()
+
+
+def list_playbooks():
+    with _connect() as c:
+        return c.execute("select topic, save_count, updated_at from playbooks order by updated_at desc").fetchall()
 
 
 def add_feedback(question, answer, helpful, save_ids):
