@@ -46,7 +46,7 @@ HELP = """Your Second Brain 🧠
 
 SAVE: share a YouTube video, Instagram reel, or an X, LinkedIn or Reddit post. Or send screenshots, a voice note, a video file or a PDF. Forwarded messages get saved too.
 NOTE: /note <text> saves your own thought.
-ASK: just type a question, e.g. "how do I handle price objections?"
+ASK: type your situation or question (or send a voice note and tap Ask), e.g. "client says we're too expensive". I may ask one quick question first. Tap 👎 on an answer to make me try harder.
 
 /find <words>  find a save (to read or delete it)
 /topics  browse saves by topic
@@ -157,6 +157,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip()
     urls = list(dict.fromkeys(URL_RE.findall(text)))
     replied = msg.reply_to_message
+    if replied and replied.message_id in _clarify:  # answering the bot's quick question in his own words
+        pending = _clarify.pop(replied.message_id)
+        await respond(msg, pending["q"] + f"\n(More detail from Arun: {text})", ask_first=False)
+        return
     if replied and replied.from_user and replied.from_user.is_bot:
         m = SCOPED_RE.match(replied.text or "")
         if m:  # a reply to one of the bot's messages about ONE save
@@ -218,9 +222,7 @@ async def on_save_or_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "sv":
         await save_text(q.message, text)
     else:
-        status = await q.message.reply_text("🔎 Looking through your saves…")
-        answer, markup = await _answer(text)
-        await status.edit_text(answer, reply_markup=markup, disable_web_page_preview=True)
+        await respond(q.message, text)
 
 
 # ---------- files: voice notes, videos, PDFs, screenshot groups ----------
@@ -256,7 +258,46 @@ async def _save_files(reply_to, tg_files, kind, caption, label):
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     f = msg.voice or msg.audio
+    if msg.voice and not msg.forward_origin:  # his own voice note: could be an idea to save OR a question
+        _voices[msg.message_id] = (f, f.mime_type or "audio/ogg")
+        await msg.reply_text("🎙 Ask this as a question, or save it?", reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❓ Ask it", callback_data=f"va:{msg.message_id}"),
+            InlineKeyboardButton("💾 Save it", callback_data=f"vs:{msg.message_id}")]]))
+        return
     await _save_files(msg, [(f, f.mime_type or "audio/ogg")], "voice", (msg.caption or "").strip(), "voice note")
+
+
+_voices = {}  # message_id -> (telegram file, mime) waiting for Ask / Save
+
+
+async def on_voice_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    action, mid = q.data.split(":")
+    pending = _voices.pop(int(mid), None)
+    if not pending:
+        await q.edit_message_text("I lost that voice note (the bot restarted). Please send it again.")
+        return
+    f, mime = pending
+    if action == "vs":
+        await q.edit_message_text("💾 Saving your voice note…")
+        await _save_files(q.message, [(f, mime)], "voice", "", "voice note")
+        return
+    if (f.file_size or 0) > MAX_TG_FILE:
+        await q.edit_message_text("That voice note is too long for me to download. Try a shorter one.")
+        return
+    await q.edit_message_text("🎙 Listening…")
+    try:
+        data = bytes(await (await f.get_file()).download_as_bytearray())
+        question = await asyncio.to_thread(brain.transcribe, data, mime)
+    except Exception as e:
+        log.exception("voice question failed")
+        await q.edit_message_text(_friendly_error(e))
+        return
+    await q.edit_message_text(f"🎙 You asked: {question}")
+    await respond(q.message, question)
 
 
 async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -458,29 +499,30 @@ FOLLOW_UP_SECONDS = 10 * 60
 FOLLOW_UP_RE = re.compile(r"\b(it|that|this|these|those|them|they|why|more|again|explain|example|step|steps)\b", re.I)
 
 
-async def _answer(question, only_id=None):
-    """Search the saves and write an answer with sources. Returns (text, buttons or None).
-    only_id: answer from that one save (when Arun replies to a save's message)."""
-    rows = []
+async def _answer(question, only_id=None, previous=None, rows=None):
+    """Search the saves and write an answer with sources. Returns (text, buttons or None, rows used).
+    only_id: answer from that one save (when Arun replies to a save's message).
+    previous: an answer he rated 👎 — search wider and think harder this time."""
     try:
         recent = time.time() - _last_qa["at"] < FOLLOW_UP_SECONDS
-        if recent and not only_id and _last_qa["id"] and len(question) <= 40 and FOLLOW_UP_RE.search(question):
+        if recent and not only_id and not previous and _last_qa["id"] and len(question) <= 40 and FOLLOW_UP_RE.search(question):
             only_id = _last_qa["id"]  # short follow-up after asking about one save: stay on that save
-        history = f"Q: {_last_qa['q']}\nA: {_last_qa['a'][:1500]}" if recent else ""
+        history = f"Q: {_last_qa['q']}\nA: {_last_qa['a'][:1500]}" if recent and not previous else ""
         if only_id:
             row = await asyncio.to_thread(db.get, only_id)
             rows = [tuple(row) + (1.0,)] if row else []
             if not rows:
                 _last_qa["id"] = None
-                return f"Save #{only_id} doesn't exist anymore.", None
-        else:
+                return f"Save #{only_id} doesn't exist anymore.", None, []
+        elif rows is None:
             # a short follow-up ("why?", "tell me more") is searched together with the previous question
             query = f"{_last_qa['q']} {question}" if history and len(question) < 60 else question
-            rows = await asyncio.to_thread(memory.search, query, 6)
-            if not rows:
-                return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me.", None
+            rows = await asyncio.to_thread(memory.search, query, 10 if previous else 6)
+        if not rows:
+            return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me.", None, []
         profile = await asyncio.to_thread(db.get_setting, "profile", "")
-        text = await asyncio.to_thread(brain.answer, question, rows, history, 30000 if only_id else 6000, profile)
+        excerpt = 30000 if only_id else (12000 if previous else 6000)
+        text = await asyncio.to_thread(brain.answer, question, rows, history, excerpt, profile, previous)
         _last_qa.update(at=time.time(), q=question, a=text, id=only_id)
         cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 0 < int(n) <= len(rows)})
         sources = []
@@ -490,22 +532,101 @@ async def _answer(question, only_id=None):
             if r[3]:
                 line += f"\n{r[3]}"
             sources.append(line)
-        return _short(text + ("\n\nSources:\n" + "\n".join(sources) if sources else "")), None
+        return _short(text + ("\n\nSources:\n" + "\n".join(sources) if sources else "")), None, rows
     except Exception as e:
         log.exception("ask failed")
         s = str(e)
         if rows and ("429" in s or "RESOURCE_EXHAUSTED" in s):
             # Gemini's free limit is used up: still show the saves that match, so the answer isn't lost
             return ("Gemini's free limit is used up for today, so I can't write an answer.\n"
-                    "These saves match your question. Tap to read:"), _list_markup([(r[0], r[4]) for r in rows[:5]])
-        return _friendly_error(e), None
+                    "These saves match your question. Tap to read:"), _list_markup([(r[0], r[4]) for r in rows[:5]]), rows
+        return _friendly_error(e), None, rows or []
+
+
+# answers waiting for 👍/👎 and questions waiting for Arun's quick reply (kept in memory; fine for one person)
+_answers = {}    # answer message_id -> {"q", "only_id", "text", "ids"}
+_clarify = {}    # clarifying-question message_id -> original question
+
+
+def _rate_buttons(mid):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("👍", callback_data=f"up:{mid}"),
+                                  InlineKeyboardButton("👎 Try harder", callback_data=f"dn:{mid}")]])
+
+
+async def respond(reply_to, question, only_id=None, ask_first=True):
+    """Answer a question in the chat. Like a good coach, it may first ask ONE quick question when the right advice
+    depends on a missing detail; then the answer comes with 👍 / 👎 (👎 = try again, harder)."""
+    status = await reply_to.reply_text("🔎 Looking through your saves…")
+    rows = None
+    recent = time.time() - _last_qa["at"] < FOLLOW_UP_SECONDS
+    if ask_first and not only_id and not (recent and len(question) < 60):  # never for follow-ups
+        try:
+            rows = await asyncio.to_thread(memory.search, question, 6)
+            profile = await asyncio.to_thread(db.get_setting, "profile", "")
+            c = await asyncio.to_thread(brain.clarify_check, question, profile, [r[4] for r in rows])
+            if c.ask and c.question:
+                buttons = [[InlineKeyboardButton(o, callback_data=f"cl:{status.message_id}:{n}")]
+                           for n, o in enumerate(c.options)]
+                buttons.append([InlineKeyboardButton("⏩ Just answer", callback_data=f"cl:{status.message_id}:x")])
+                _clarify[status.message_id] = {"q": question, "options": c.options}
+                await status.edit_text(f"🤔 Quick question so the advice fits: {c.question}\n\n"
+                                       f"Tap one, or reply to this message in your own words.",
+                                       reply_markup=InlineKeyboardMarkup(buttons))
+                return
+        except Exception:
+            log.exception("clarify check failed; answering directly")
+    await _send_answer(status, question, only_id, rows=rows)
+
+
+async def _send_answer(status, question, only_id=None, previous=None, rows=None):
+    text, markup, used = await _answer(question, only_id, previous, rows)
+    if markup is None and used:  # a real answer: add 👍 / 👎
+        markup = _rate_buttons(status.message_id)
+        _answers[status.message_id] = {"q": question, "only_id": only_id, "text": text, "ids": [r[0] for r in used]}
+    await status.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
 
 
 async def ask(update, question, only_id=None):
-    status = await update.message.reply_text("🔎 Looking through your saves…")
-    text, markup = await _answer(question, only_id)
-    await status.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+    await respond(update.message, question, only_id)
 
+
+async def on_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A tap on one of the quick-question options (cl:<msg>:<n>) or ⏩ Just answer (cl:<msg>:x)."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    _, mid, choice = q.data.split(":")
+    pending = _clarify.pop(int(mid), None)
+    if not pending:
+        await q.edit_message_text("I lost that question (the bot restarted). Please ask again.")
+        return
+    question = pending["q"]
+    if choice != "x":
+        question += f"\n(More detail from Arun: {pending['options'][int(choice)]})"
+    await q.edit_message_text("🔎 Got it, thinking…")
+    await _send_answer(q.message, question)
+
+
+async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """👍 = remember it helped. 👎 = try again: wider search, more of each save, longer thinking."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    action, mid = q.data.split(":")
+    info = _answers.get(int(mid))
+    if not info:
+        await q.answer("That answer is too old to rate.")
+        return
+    await asyncio.to_thread(db.add_feedback, info["q"], info["text"], action == "up", info["ids"])
+    if action == "up":
+        await q.answer("👍 Noted, thanks!")
+        await q.edit_message_reply_markup(None)
+        return
+    await q.answer("Trying harder…")
+    await q.edit_message_reply_markup(None)
+    status = await q.message.reply_text("🔎 Searching wider and thinking harder…")
+    await _send_answer(status, info["q"], info["only_id"], previous=info["text"])
 
 def _list_markup(rows):
     """One row of buttons per save: 📖 #id title  |  🗑"""
@@ -981,6 +1102,9 @@ def build_app():
     app.add_handler(CommandHandler("me", cmd_me, filters=me))
     app.add_handler(CommandHandler("memtest", cmd_memtest, filters=me))
     app.add_handler(CallbackQueryHandler(on_extra_button, pattern=r"^(st|rs):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_clarify, pattern=r"^cl:\d+:(\d+|x)$"))
+    app.add_handler(CallbackQueryHandler(on_rate, pattern=r"^(up|dn):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_voice_choice, pattern=r"^(va|vs):\d+$"))
     app.add_handler(MessageHandler(me & (filters.VOICE | filters.AUDIO), on_voice))
     app.add_handler(MessageHandler(me & (filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO), on_video))
     app.add_handler(MessageHandler(me & filters.Document.PDF, on_pdf))

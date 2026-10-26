@@ -391,6 +391,12 @@ def finish_toget(save_id):
         return c.execute("update toget set done = true where save_id = %s and not done", (save_id,)).rowcount
 
 
+def add_feedback(question, answer, helpful, save_ids):
+    with _connect() as c:
+        c.execute("insert into feedback (question, answer, helpful, save_ids) values (%s, %s, %s, %s)",
+                  (question, answer, helpful, save_ids))
+
+
 def all_for_backup():
     with _connect() as c:
         return c.execute(

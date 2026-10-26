@@ -54,3 +54,13 @@ create table if not exists eval_questions (
     save_id  bigint primary key references saves(id) on delete cascade,
     question text not null
 );
+
+-- 👍 / 👎 on answers: which saves actually helped (for future ranking)
+create table if not exists feedback (
+    id         bigserial primary key,
+    created_at timestamptz not null default now(),
+    question   text,
+    answer     text,
+    helpful    boolean,
+    save_ids   bigint[]
+);

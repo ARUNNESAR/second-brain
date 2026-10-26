@@ -448,26 +448,35 @@ def weekly_recap(rows, throwback=None):
     return (resp.text or "").strip()
 
 
-ANSWER_RULES = """You are Arun's sharp, practical advisor. His saved notes (from videos and posts he chose to learn
-from) are your main source. Think about HIS situation first, then use the notes to tell him what to actually do.
+ANSWER_RULES = """Arun saves videos and posts from people who are great at things (sales, negotiation, coding,
+content, communication, career, anything). You are his panel of those mentors, standing next to him in a real moment
+of need. Use what THEY taught (the saved notes) to tell him exactly what to do now.
 
 How to answer:
-1. Start with the direct answer for his situation in 1-2 lines. No greeting, no restating the question.
-2. Then the concrete moves: what to do and, when it fits, the exact words to say. Pull the specific techniques, steps,
-   numbers and example lines out of the notes and APPLY them to his case. Don't just list what each video said.
-3. When several notes help, combine them into one plan (e.g. first X from [1], then Y from [3]).
-4. Cite the note after each point that comes from it, like [1] or [2].
-5. If the notes only partly cover it, you may add your own reasoning, clearly marked with "My take:". Keep it short and
-   never present it as something he saved.
-6. If nothing in the notes fits, say so in one line, then give a short "My take:".
-7. If the notes DISAGREE, don't blend them or quietly pick one: start with "Your saves disagree:", give each side in one
-   line with its citation, saved date and reason, say which is newer, and let Arun decide.
-Style: plain, friendly English like a smart friend. Short (aim for under 200 words). Bullet points for steps.
+1. First line: the direct answer for his situation. No greeting, no restating the question.
+2. "What your mentors would tell you": the 2-4 most useful moves from the notes, each APPLIED to his situation, with the
+   specific technique, steps, numbers or exact words to say. Name the source naturally (the creator if the note names
+   them, otherwise the video's title) and cite it like [1]. Combine several mentors into one plan when they fit together.
+3. "Your move now": 1-3 concrete next actions or the exact lines to say, in order.
+4. Only if the notes don't fully cover it: a short "My take:" with your own reasoning, never presented as something
+   he saved. If nothing fits at all, say so in one line, then "My take:".
+5. If the notes DISAGREE: start with "Your saves disagree:", give each side in one line with citation, saved date and
+   reason, say which is newer, and let him decide.
+Style: plain, friendly English like a smart friend who has been there. Short (under 220 words). Bullet points for steps.
 Plain text only: no markdown headings, no ** bold **, no tables."""
 
+DEEPER = """
+His previous answer to this question was NOT helpful enough:
+---
+{previous}
+---
+Do clearly better: be more specific to his situation, use more of the notes' concrete details (exact steps, numbers,
+words to say), fix anything vague or generic, and don't repeat the same advice in the same way."""
 
-def answer(question, rows, history="", excerpt=6000, profile=""):
-    """history: the previous question + answer, so follow-ups like 'tell me more' make sense."""
+
+def answer(question, rows, history="", excerpt=6000, profile="", previous=None):
+    """history: the previous question + answer, so follow-ups like 'tell me more' make sense.
+    previous: an answer Arun rated 👎; the retry then thinks longer and must do better."""
     blocks = []
     for i, r in enumerate(rows, 1):
         _, created, stype, url, title, topic, summary, points, content = r[:9]
@@ -478,9 +487,43 @@ def answer(question, rows, history="", excerpt=6000, profile=""):
     prev = f"\n\nEarlier in this chat (for context only):\n{history}" if history else ""
     if profile:  # who Arun is, so advice fits his real situation
         prev = f"\n\nAbout Arun (use this to tailor the advice):\n{profile}" + prev
+    rules = ANSWER_RULES + (DEEPER.format(previous=previous[:3000]) if previous else "")
     resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + prev + f"\n\nArun's question: {question}",
-        config=types.GenerateContentConfig(system_instruction=ANSWER_RULES,
-                                           thinking_config=types.ThinkingConfig(thinking_budget=2048)),
+        config=types.GenerateContentConfig(system_instruction=rules, thinking_config=types.ThinkingConfig(
+            thinking_budget=8192 if previous else 2048)),
         models=ANSWER_MODELS,  # the best models first: reasoning quality matters most here
     )
+    return (resp.text or "").strip()
+
+
+class Clarify(BaseModel):
+    ask: bool            # true only if the best advice really depends on something we don't know
+    question: str        # one short question to ask Arun
+    options: list[str]   # 2-3 likely answers as short tap buttons (under 25 characters each)
+
+
+def clarify_check(question, profile, titles):
+    """Like a good coach: before advising on a vague situation, ask ONE quick question (only when it truly matters)."""
+    resp = _generate(
+        contents=f"About Arun: {profile or 'unknown'}\nRelevant saves he has: " + "; ".join(titles[:6]) +
+                 f"\n\nArun's message: {question}",
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "Decide if ONE short clarifying question is needed before giving him advice. Ask only when the right "
+                "advice would be clearly different depending on a missing detail (who the other person is, the goal, "
+                "the stage, the constraint). Do NOT ask if the message is already specific, is a simple factual or "
+                "how-to question, or asks for a list/summary. Most messages need no question."),
+            response_mime_type="application/json", response_schema=Clarify),
+        models=SAVE_MODELS)
+    c = resp.parsed if resp.parsed else Clarify(**json.loads(resp.text or '{"ask": false, "question": "", "options": []}'))
+    c.options = [o[:30] for o in c.options[:3]]
+    return c
+
+
+def transcribe(audio_bytes, mime):
+    """What Arun said in a voice note (to answer it as a question)."""
+    resp = _generate(contents=[types.Part.from_bytes(data=audio_bytes, mime_type=mime),
+                               "Write down exactly what is said in this voice note, in English (translate Tamil/Hindi). "
+                               "Reply with the words only."],
+                     config=types.GenerateContentConfig(), models=SAVE_MODELS)
     return (resp.text or "").strip()
