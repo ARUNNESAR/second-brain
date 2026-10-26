@@ -543,6 +543,7 @@ ACTIONS = {
     "worked": "a tip/save WORKED for him in real life (target = which one)",
     "screen_text": "get the text/prompt shown on screen in a saved video (target = which one)",
     "resource": "get the resource/link a creator offers (comment-for-link) (target = which one)",
+    "voice_replies": "turn voice replies on / off / back to automatic (text = always / off / auto)",
     "backup": "make a backup now",
     "export": "download/export everything",
     "help": "how to use the bot / what can you do",
@@ -650,6 +651,54 @@ def build_playbook(topic, rows, profile=""):
                              "None of these tips is proven by Arun yet: never write 'proven by you' or a ✅ mark.")),
                          max_output_tokens=12000))
     return (resp.text or "").strip()
+
+
+# ---------- Voice replies (Gemini text-to-speech → MP3 voice note) ----------
+
+# Free plan: about 10 voice replies a day per model. His REELS use gemini-3.8-flash-lite-tts, so that one goes last
+# (Google can share free quotas within one account), keeping his reel voice quota for reels.
+TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-3.8-flash-tts",
+              "gemini-3.8-flash-lite-tts"]
+MENTOR_VOICE = "Puck"      # his chosen voice: young man, mid-twenties, slow relaxed pace
+OTHER_VOICE = "Charon"     # the other person in practice mode: a different, clearly separate voice
+
+
+def spoken_version(text, limit=900):
+    """Turn a chat answer into something nice to listen to: no sources, links, [1] marks, emoji or bullets."""
+    text = re.split(r"\n\s*Sources:", text)[0]
+    text = re.sub(r"https?://\S+", "", text)
+    text = re.sub(r"\[\d+\]|#\d+", "", text)
+    text = re.sub(r"[*_`#>•]|[\U0001F300-\U0001FAFF☀-➿]", "", text)
+    text = re.sub(r"\n\s*-\s*", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if len(text) > limit:  # about a minute of speech; the full answer is in the text above it
+        text = text[:limit].rsplit(". ", 1)[0] + "."
+    return text
+
+
+def speak(text, voice=MENTOR_VOICE, style="Read this like a calm, friendly mentor talking to a friend, at a slow, "
+                                          "relaxed pace"):
+    """Text → MP3 bytes (Telegram plays MP3 as a voice note). Needs no ffmpeg."""
+    import io as _io
+    import wave
+    import lameenc
+    resp = _generate(contents=f"{style}:\n\n{text}", models=TTS_MODELS, config=types.GenerateContentConfig(
+        response_modalities=["AUDIO"], speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)))))
+    blob = resp.candidates[0].content.parts[0].inline_data
+    data, rate = blob.data, 24000
+    if "wav" in (blob.mime_type or ""):
+        with wave.open(_io.BytesIO(data)) as w:
+            rate, data = w.getframerate(), w.readframes(w.getnframes())
+    else:
+        m = re.search(r"rate=(\d+)", blob.mime_type or "")
+        rate = int(m.group(1)) if m else rate
+    enc = lameenc.Encoder()
+    enc.set_bit_rate(48)
+    enc.set_in_sample_rate(rate)
+    enc.set_channels(1)
+    enc.set_quality(2)
+    return bytes(enc.encode(data) + enc.flush())
 
 
 def transcribe(audio_bytes, mime):

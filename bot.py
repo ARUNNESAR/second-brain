@@ -297,7 +297,7 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data = bytes(await (await f.get_file()).download_as_bytearray())
         said = await asyncio.to_thread(brain.transcribe, data, f.mime_type or "audio/ogg")
         await msg.reply_text(f"🎙 {said}")
-        await practice_reply(msg, said)
+        await practice_reply(msg, said, by_voice=True)
         return
     if msg.voice and not msg.forward_origin:  # his own voice note: could be an idea to save OR a question
         _voices[msg.message_id] = (f, f.mime_type or "audio/ogg")
@@ -338,7 +338,7 @@ async def on_voice_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(_friendly_error(e))
         return
     await q.edit_message_text(f"🎙 You said: {question}")
-    await handle_words(q.message, context, question)  # a question, or a request like "delete the last one"
+    await handle_words(q.message, context, question, by_voice=True)  # a question, or a request like "delete…"
 
 
 async def on_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -587,7 +587,7 @@ def _rate_buttons(mid):
                                   InlineKeyboardButton("👎 Try harder", callback_data=f"dn:{mid}")]])
 
 
-async def respond(reply_to, question, only_id=None, ask_first=True):
+async def respond(reply_to, question, only_id=None, ask_first=True, by_voice=False):
     """Answer a question in the chat. Like a good coach, it may first ask ONE quick question when the right advice
     depends on a missing detail; then the answer comes with 👍 / 👎 (👎 = try again, harder)."""
     status = await reply_to.reply_text("🔎 Looking through your saves…")
@@ -602,22 +602,47 @@ async def respond(reply_to, question, only_id=None, ask_first=True):
                 buttons = [[InlineKeyboardButton(o, callback_data=f"cl:{status.message_id}:{n}")]
                            for n, o in enumerate(c.options)]
                 buttons.append([InlineKeyboardButton("⏩ Just answer", callback_data=f"cl:{status.message_id}:x")])
-                _clarify[status.message_id] = {"q": question, "options": c.options}
+                _clarify[status.message_id] = {"q": question, "options": c.options, "voice": by_voice}
                 await status.edit_text(f"🤔 Quick question so the advice fits: {c.question}\n\n"
                                        f"Tap one, or reply to this message in your own words.",
                                        reply_markup=InlineKeyboardMarkup(buttons))
                 return
         except Exception:
             log.exception("clarify check failed; answering directly")
-    await _send_answer(status, question, only_id, rows=rows)
+    await _send_answer(status, question, only_id, rows=rows, by_voice=by_voice)
 
 
-async def _send_answer(status, question, only_id=None, previous=None, rows=None):
+async def _send_answer(status, question, only_id=None, previous=None, rows=None, by_voice=False):
     text, markup, used = await _answer(question, only_id, previous, rows)
     if markup is None and used:  # a real answer: add 👍 / 👎
         markup = _rate_buttons(status.message_id)
         _answers[status.message_id] = {"q": question, "only_id": only_id, "text": text, "ids": [r[0] for r in used]}
     await status.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+    if used and markup is not None and await _want_voice(by_voice):
+        asyncio.create_task(_send_voice(brain.spoken_version(text), status.message_id))
+
+
+# ---------- voice replies: asked by voice → answered by voice (Puck); "always by voice" / "voice off" ----------
+
+async def _want_voice(by_voice):
+    mode = await asyncio.to_thread(db.get_setting, "voice", "auto")
+    return mode == "on" or (mode == "auto" and by_voice)
+
+
+async def _send_voice(text, reply_to_id, voice=None, style=None):
+    """Send text as a voice note. Never breaks the chat: if speech fails, the text answer is already there."""
+    if not (_bot and text.strip()):
+        return
+    try:
+        kw = {"voice": voice} if voice else {}
+        if style:
+            kw["style"] = style
+        mp3 = await asyncio.to_thread(brain.speak, text, **kw)
+        buf = io.BytesIO(mp3)
+        buf.name = "reply.mp3"
+        await _bot.send_voice(OWNER, voice=buf, reply_to_message_id=reply_to_id, allow_sending_without_reply=True)
+    except Exception:
+        log.exception("voice reply failed (text answer was sent)")
 
 
 async def ask(update, question, only_id=None):
@@ -639,7 +664,7 @@ async def on_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if choice != "x":
         question += f"\n(More detail from Arun: {pending['options'][int(choice)]})"
     await q.edit_message_text("🔎 Got it, thinking…")
-    await _send_answer(q.message, question)
+    await _send_answer(q.message, question, by_voice=pending.get("voice", False))
 
 
 async def on_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -965,7 +990,7 @@ async def _resolve(target, reply_save=None):
     return rows[0][0] if rows else None
 
 
-async def handle_words(msg, context, text, reply_save=None):
+async def handle_words(msg, context, text, reply_save=None, by_voice=False):
     """Understand what he wants from plain words (or a voice note), then do it."""
     try:
         intent = await asyncio.to_thread(brain.classify, text)
@@ -977,7 +1002,7 @@ async def handle_words(msg, context, text, reply_save=None):
     log.info("words -> %s", a)
 
     if a == "ask":
-        await respond(msg, text, only_id=reply_save)
+        await respond(msg, text, only_id=reply_save, by_voice=by_voice)
     elif a == "save_note":
         await save_text(msg, payload or text)
     elif a in ("delete", "worked", "screen_text", "resource"):
@@ -1016,6 +1041,12 @@ async def handle_words(msg, context, text, reply_save=None):
         await cmd_recap(u, c)
     elif a == "practice":
         await start_practice(msg, payload or text)
+    elif a == "voice_replies":
+        p = (payload + " " + text).lower()
+        mode = "off" if ("off" in p or "stop" in p or "don't" in p) else "on" if ("always" in p or " on" in p) else "auto"
+        await asyncio.to_thread(db.set_setting, "voice", mode)
+        await msg.reply_text({"on": "🔊 I'll answer every question by voice too.", "off": "🔇 Voice replies off. Text only.",
+                              "auto": "🎙 I'll reply by voice when you ask by voice."}[mode])
     elif a == "playbook":
         await make_playbook(msg, payload)
     elif a == "backup":
@@ -1058,7 +1089,7 @@ async def start_practice(msg, situation):
         await status.edit_text(_friendly_error(e))
 
 
-async def practice_reply(msg, text):
+async def practice_reply(msg, text, by_voice=False):
     if time.time() - _practice.get("at", 0) > PRACTICE_IDLE:
         _practice.clear()
         await handle_words(msg, None, text)
@@ -1071,6 +1102,10 @@ async def practice_reply(msg, text):
                                        _practice["history"], _practice.get("profile", ""))
         _practice["history"].append(("bot", turn))
         await status.edit_text(_short(turn), reply_markup=_end_button())
+        if await _want_voice(by_voice):  # the other person SPEAKS their line, in a different voice; coach stays text
+            line = turn.split("💡")[0].strip().strip('"')
+            asyncio.create_task(_send_voice(line, status.message_id, voice=brain.OTHER_VOICE,
+                                            style="Say this naturally, like a real person in a live conversation"))
     except Exception as e:
         log.exception("practice turn failed")
         await status.edit_text(_friendly_error(e))

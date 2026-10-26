@@ -180,6 +180,22 @@ async def telegram_webhook(request: Request):
     return PlainTextResponse("ok")
 
 
+@mcp.custom_route("/selftest/{key}", methods=["GET"])
+async def selftest(request: Request):
+    """Checks the parts that can only be tested on the server itself (e.g. the MP3 encoder for voice replies).
+    Protected by the same secret as the connector address."""
+    if request.path_params.get("key") != MCP_SECRET:
+        return PlainTextResponse("not found", status_code=404)
+    out = {}
+    try:
+        mp3 = await asyncio.to_thread(brain.speak, "Self test. Voice replies are working.")
+        out["voice_reply_mp3_bytes"] = len(mp3)
+        out["voice_ok"] = mp3[:3] == b"ID3" or mp3[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
+    except Exception as e:
+        out["voice_ok"], out["voice_error"] = False, str(e)[:300]
+    return JSONResponse(out)
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request):
     return JSONResponse({"ok": True})
