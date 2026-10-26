@@ -209,7 +209,8 @@ def _welcome_buttons():
          InlineKeyboardButton("📚 My topics", callback_data="ex:topics")],
         [InlineKeyboardButton("🎭 Practice a conversation", callback_data="ex:practice"),
          InlineKeyboardButton("📘 Make a playbook", callback_data="ex:playbook")],
-        [InlineKeyboardButton("❓ Everything I can do", callback_data="ex:help")]])
+        [InlineKeyboardButton("🙋 Tell me about you", callback_data="ex:me"),
+         InlineKeyboardButton("❓ Everything I can do", callback_data="ex:help")]])
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -238,6 +239,12 @@ async def on_example(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    "• a job interview for a product role")
     elif what == "playbook":
         await make_playbook(q.message, "")
+    elif what == "me":
+        _awaiting["profile"] = True
+        now = await asyncio.to_thread(db.get_setting, "profile", "")
+        await q.message.reply_text((f"Here's what I know now:\n{now}\n\n" if now else "") +
+                                   "🙋 Tell me a bit about yourself in a few lines: what you do, what you're working on, "
+                                   "your goals. I'll use it to make every answer fit you.")
     else:
         await q.message.reply_text(HELP)
 
@@ -274,6 +281,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await attach_to(msg, reply_save, text=re.sub(r"^add:?\s*", "", text, flags=re.I))  # DM link / text
         else:
             await handle_words(msg, context, text, reply_save=reply_save)  # "screen text", "worked", a question…
+        return
+    if _awaiting.pop("profile", None):  # he tapped "🙋 Tell me about you": this is the description
+        await asyncio.to_thread(db.set_setting, "profile", text[:2000])
+        await msg.reply_text("✅ Thanks! Every answer will now fit you.")
+        return
+    if "attach" in _awaiting:  # he tapped "📎 I got it": this is the resource (link or text)
+        await attach_to(msg, _awaiting.pop("attach"), text=text)
         return
     if "ask" in _awaiting and not urls:  # he tapped "❓ Ask about it": this is the question
         await respond(msg, text, only_id=_awaiting.pop("ask"))
@@ -546,7 +560,9 @@ async def _queue_failed(bot, save_id, url, e):
     async def explain(text):
         await _react(msg_id, "😢")
         await bot.send_message(OWNER, text, reply_to_message_id=msg_id, allow_sending_without_reply=True,
-                               disable_web_page_preview=True)
+                               disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup([[
+                                   InlineKeyboardButton("🔁 Try again", callback_data=f"rt:{save_id}"),
+                                   InlineKeyboardButton("🗑 Remove", callback_data=f"x:{save_id}")]]))
 
     if isinstance(e, social.Gone) or "Video unavailable" in s or "Private video" in s:
         # deleted / private / empty: retrying won't help, say so now
@@ -593,6 +609,11 @@ async def on_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data = bytes(await (await src.get_file()).download_as_bytearray())
             await attach_to(msg, int(m.group(1)), image=(data, "image/jpeg" if msg.photo else msg.document.mime_type))
             return
+    if "attach" in _awaiting and not msg.media_group_id:  # he tapped "📎 I got it" and sent a screenshot
+        src = msg.photo[-1] if msg.photo else msg.document
+        data = bytes(await (await src.get_file()).download_as_bytearray())
+        await attach_to(msg, _awaiting.pop("attach"), image=(data, "image/jpeg" if msg.photo else msg.document.mime_type))
+        return
     if msg.media_group_id:  # several screenshots sent together: wait a moment, then save them as ONE note
         group = _albums.setdefault(msg.media_group_id, [])
         group.append(msg)
@@ -680,9 +701,17 @@ _answers = {}    # answer message_id -> {"q", "only_id", "text", "ids"}
 _clarify = {}    # clarifying-question message_id -> original question
 
 
-def _rate_buttons(mid):
+def _rate_buttons(mid, listen=True):
+    """Under every answer: was it helpful, and the two natural next steps (hear it, rehearse it)."""
+    second = [InlineKeyboardButton("🎭 Practice this", callback_data=f"pr:{mid}")]
+    if listen:
+        second.insert(0, InlineKeyboardButton("🔊 Listen", callback_data=f"ls:{mid}"))
     return InlineKeyboardMarkup([[InlineKeyboardButton("👍 Helpful", callback_data=f"up:{mid}"),
-                                  InlineKeyboardButton("👎 Not helpful", callback_data=f"dn:{mid}")]])
+                                  InlineKeyboardButton("👎 Not helpful", callback_data=f"dn:{mid}")], second])
+
+
+def _retry_button(mid):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Try again", callback_data=f"ag:{mid}")]])
 
 
 async def respond(reply_to, question, only_id=None, ask_first=True, by_voice=False):
@@ -712,11 +741,15 @@ async def respond(reply_to, question, only_id=None, ask_first=True, by_voice=Fal
 
 async def _send_answer(status, question, only_id=None, previous=None, rows=None, by_voice=False):
     text, markup, used = await _answer(question, only_id, previous, rows)
-    if markup is None and used:  # a real answer: add 👍 / 👎
-        markup = _rate_buttons(status.message_id)
+    voice = await _want_voice(by_voice)
+    if markup is None and used:  # a real answer: 👍 / 👎 plus one-tap next steps
+        markup = _rate_buttons(status.message_id, listen=not voice)
         _answers[status.message_id] = {"q": question, "only_id": only_id, "text": text, "ids": [r[0] for r in used]}
+    elif markup is None:  # it failed (e.g. out of free thinking): one tap to try again later
+        markup = _retry_button(status.message_id)
+        _answers[status.message_id] = {"q": question, "only_id": only_id, "text": "", "ids": []}
     await status.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
-    if used and markup is not None and await _want_voice(by_voice):
+    if used and _answers.get(status.message_id, {}).get("text") and voice:
         asyncio.create_task(_voice_answer(question, text, status.message_id))
         await _tip_once("voice", "🎙 You asked by voice, so I'll answer by voice too. Say \"voice replies off\" if you "
                                    "prefer text, or \"always reply by voice\".",
@@ -996,6 +1029,52 @@ async def on_save_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(f"❓ What do you want to know about “{row[4]}”? Type it or send a voice note.")
 
 
+async def on_next_step(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One-tap next steps: 🔊 Listen (ls:<answer>), 🎭 Practice this (pr:<answer>), 🔁 Try again (ag:<answer>),
+    🔁 Practice again (pa:0), 🔊 recap (lr:0), 🔁 retry a failed save (rt:<save>), 📎 I got it (ga:<save>)."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    action, arg = q.data.split(":")
+    info = _answers.get(int(arg)) if action in ("ls", "pr", "ag") else None
+    if action in ("ls", "pr", "ag") and not info:
+        await q.answer("That's an old message. Please ask again.")
+        return
+    if action == "ls":
+        await q.answer("🔊 Recording it…")
+        await _voice_answer(info["q"], info["text"], q.message.message_id)
+    elif action == "pr":
+        await q.answer()
+        await start_practice(q.message, info["q"])
+    elif action == "ag":
+        await q.answer()
+        await q.edit_message_text("🔎 Trying again…")
+        await _send_answer(q.message, info["q"], info["only_id"])
+    elif action == "pa":
+        await q.answer()
+        if _last_practice.get("situation"):
+            await start_practice(q.message, _last_practice["situation"])
+        else:
+            await q.message.reply_text("What do you want to practice? Just describe it.")
+            _awaiting["practice"] = True
+    elif action == "lr":
+        recap = _last_recap.get("text") or (q.message.text or "")
+        if not recap.strip():
+            await q.answer("Please ask for a new recap first.")
+            return
+        await q.answer("🔊 Recording it…")
+        await _send_voice(await asyncio.to_thread(brain.voice_script, "my weekly recap", recap), q.message.message_id)
+    elif action == "rt":
+        await asyncio.to_thread(db.retry_one, int(arg))
+        await q.answer("🔁 Trying again. You'll see 👌 when it's saved.")
+        await q.edit_message_reply_markup(None)
+        _kick_queue(context)
+    elif action == "ga":
+        await q.answer()
+        _awaiting["attach"] = int(arg)
+        await q.message.reply_text("📎 Send it here: the link, the text, or a screenshot of the DM.")
+
+
 async def on_setting_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🔕 Pause reminders / 🔔 back on (rem:off|on), 🔇 Text only / 🎙 Voice again (vo:off|auto)."""
     q = update.callback_query
@@ -1073,7 +1152,7 @@ async def resource_for(save_id):
         lines.append(f"\nFound this (check it's the right one):\n{found}")
     if offer.how_to_get and not found:
         await asyncio.to_thread(db.add_toget, save_id, offer.what, offer.how_to_get)
-        lines.append("\nCouldn't find it online, so it's on your /toget list.\n"
+        lines.append("\nCouldn't find it online, so I've put it on your to-get list.\n"
                      f"When you get it, reply to this message with the link, text or screenshot and I'll add it to #{save_id}.")
     return "\n".join(lines)
 
@@ -1090,7 +1169,9 @@ async def on_extra_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await q.message.reply_text(f"⏳ Looking for the {label}… (up to a minute)")
     try:
         text = await (screen_text_for(save_id) if action == "st" else resource_for(save_id))
-        await status.edit_text(_short(text), disable_web_page_preview=True)
+        got = InlineKeyboardMarkup([[InlineKeyboardButton("📎 I got it, add it", callback_data=f"ga:{save_id}")]]) \
+            if "to-get list" in text else None
+        await status.edit_text(_short(text), disable_web_page_preview=True, reply_markup=got)
     except Exception as e:
         log.exception("%s failed for #%s", label, save_id)
         await status.edit_text(_friendly_error(e))
@@ -1190,7 +1271,9 @@ async def handle_words(msg, context, text, reply_save=None, by_voice=False):
             status = await msg.reply_text("⏳ On it… (up to a minute)")
             try:
                 out = await (screen_text_for(save_id) if a == "screen_text" else resource_for(save_id))
-                await status.edit_text(_short(out), disable_web_page_preview=True)
+                got = InlineKeyboardMarkup([[InlineKeyboardButton("📎 I got it, add it", callback_data=f"ga:{save_id}")]]) \
+                    if "to-get list" in out else None
+                await status.edit_text(_short(out), disable_web_page_preview=True, reply_markup=got)
             except Exception as e:
                 log.exception("%s failed", a)
                 await status.edit_text(_friendly_error(e))
@@ -1228,6 +1311,7 @@ async def handle_words(msg, context, text, reply_save=None, by_voice=False):
 # ---------- Practice mode: rehearse a real conversation; the mentors coach between lines ----------
 
 _practice = {}  # {"active", "situation", "notes", "history", "at"}
+_last_practice = {}  # the situation of the last finished practice, for 🔁 Practice again
 PRACTICE_IDLE = 30 * 60  # a session left alone for 30 minutes ends by itself
 
 
@@ -1287,7 +1371,9 @@ async def end_practice(msg):
     try:
         out = await asyncio.to_thread(brain.practice_debrief, _practice["situation"], _practice["notes"],
                                       _practice["history"])
-        await status.edit_text(_short(f"🏁 Practice debrief\n\n{out}"))
+        _last_practice["situation"] = _practice["situation"]
+        await status.edit_text(_short(f"🏁 Practice debrief\n\n{out}"), reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔁 Practice again", callback_data="pa:0")]]))
     except Exception as e:
         log.exception("debrief failed")
         await status.edit_text(_friendly_error(e))
@@ -1340,7 +1426,10 @@ async def make_playbook(msg, topic):
                                       f"{topic} playbook\" any time you've saved more."))
         buf = io.BytesIO(text.encode("utf-8"))
         buf.name = f"{topic.title()} Playbook.md"
-        await msg.reply_document(buf, caption=f"📘 {topic.title()} Playbook ({len(rows)} saves)")
+        await msg.reply_document(buf, caption=f"📘 {topic.title()} Playbook ({len(rows)} saves)",
+                                 reply_markup=InlineKeyboardMarkup([[
+                                     InlineKeyboardButton("🔄 Update it", callback_data="pb:" + _fit_bytes(topic, 60)),
+                                     InlineKeyboardButton("📘 Another topic", callback_data="ex:playbook")]]))
     except Exception as e:
         log.exception("playbook failed")
         await status.edit_text(_friendly_error(e))
@@ -1471,6 +1560,13 @@ async def daily_tip(context: ContextTypes.DEFAULT_TYPE):
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 
+_last_recap = {}
+
+
+def _listen_recap():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔊 Listen", callback_data="lr:0")]])
+
+
 async def build_recap():
     rows = await asyncio.to_thread(db.since, 7)
     throwback = await asyncio.to_thread(db.random_older, 7)
@@ -1485,7 +1581,8 @@ async def build_recap():
 async def weekly_recap(context: ContextTypes.DEFAULT_TYPE):
     try:
         text = await build_recap()
-        await context.bot.send_message(OWNER, _short(text), disable_web_page_preview=True)
+        _last_recap["text"] = text
+        await context.bot.send_message(OWNER, _short(text), disable_web_page_preview=True, reply_markup=_listen_recap())
         log.info("weekly recap sent")
     except Exception:
         log.exception("weekly recap failed")
@@ -1494,7 +1591,8 @@ async def weekly_recap(context: ContextTypes.DEFAULT_TYPE):
 async def cmd_recap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("⏳ Making your recap of the last 7 days…")
     try:
-        await status.edit_text(_short(await build_recap()), disable_web_page_preview=True)
+        _last_recap["text"] = await build_recap()
+        await status.edit_text(_short(_last_recap["text"]), disable_web_page_preview=True, reply_markup=_listen_recap())
     except Exception as e:
         log.exception("recap failed")
         await status.edit_text(_friendly_error(e))
@@ -1570,6 +1668,7 @@ def build_app():
     app.add_handler(CallbackQueryHandler(on_undo, pattern=r"^u:\d+$"))
     app.add_handler(CallbackQueryHandler(on_save_button, pattern=r"^(m|wk|aq):\d+$"))
     app.add_handler(CallbackQueryHandler(on_setting_button, pattern=r"^(rem|vo):\w+$"))
+    app.add_handler(CallbackQueryHandler(on_next_step, pattern=r"^(ls|pr|ag|pa|lr|rt|ga):\d+$"))
     app.add_handler(CallbackQueryHandler(on_save_or_ask, pattern=r"^(sv|ak):\d+$"))
     app.add_handler(CallbackQueryHandler(on_topic, pattern=r"^t:"))
     app.add_handler(MessageHandler(~me, ignore_strangers))
