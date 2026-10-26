@@ -24,6 +24,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
 import backup  # noqa: E402
 import brain  # noqa: E402
 import db  # noqa: E402
+import memory  # noqa: E402
 import social  # noqa: E402
 
 os.makedirs(os.path.join(HERE, "logs"), exist_ok=True)
@@ -54,6 +55,8 @@ ASK: just type a question, e.g. "how do I handle price objections?"
 /fix <number> <correction>  correct a note that got something wrong
 /delete <number>  remove a save
 /retry  try again on links that failed
+/me  tell me about yourself so answers fit you
+/memtest  check how well I remember your saves
 /recap  recap of the last 7 days (it also comes by itself every Sunday 9 AM)
 
 Every other morning at 9 AM you get one old save to remember (/reminders off to pause).
@@ -131,7 +134,16 @@ async def _store(note, source_type, url, pending_id=None):
     dup = await asyncio.to_thread(db.similar, vec, save_id)
     if dup:
         _similar[save_id] = dup
+    await _index(save_id)
     return save_id
+
+
+async def _index(save_id):
+    """Split the save into search chunks. A failure here must never lose the save: the daily job retries it."""
+    try:
+        await asyncio.to_thread(memory.index_save, save_id)
+    except Exception:
+        log.exception("indexing #%s failed (will retry tonight)", save_id)
 
 
 # ---------- handlers ----------
@@ -464,11 +476,11 @@ async def _answer(question, only_id=None):
         else:
             # a short follow-up ("why?", "tell me more") is searched together with the previous question
             query = f"{_last_qa['q']} {question}" if history and len(question) < 60 else question
-            vec = await asyncio.to_thread(brain.embed, query, True)
-            rows = await asyncio.to_thread(db.search, vec, 6)
+            rows = await asyncio.to_thread(memory.search, query, 6)
             if not rows:
                 return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me.", None
-        text = await asyncio.to_thread(brain.answer, question, rows, history, 30000 if only_id else 6000)
+        profile = await asyncio.to_thread(db.get_setting, "profile", "")
+        text = await asyncio.to_thread(brain.answer, question, rows, history, 30000 if only_id else 6000, profile)
         _last_qa.update(at=time.time(), q=question, a=text, id=only_id)
         cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 0 < int(n) <= len(rows)})
         sources = []
@@ -596,6 +608,7 @@ async def cmd_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title, topic, summary, points = row
     vec = await asyncio.to_thread(brain.embed, f"{title}\nTopic: {topic}\n{summary}\n" + "\n".join(points))
     await asyncio.to_thread(db.set_embedding, save_id, vec)
+    await _index(save_id)
     await update.message.reply_text(f"✏️ Fixed #{save_id}: {title}\nYour correction is now part of the note.")
 
 
@@ -665,6 +678,7 @@ async def _reembed(row):
     extra = (content or "").split("\n\n--- ", 1)[1][:3000] if "\n\n--- " in (content or "") else ""
     vec = await asyncio.to_thread(brain.embed, f"{title}\nTopic: {topic}\n{summary}\n" + "\n".join(points or []) + "\n" + extra)
     await asyncio.to_thread(db.set_embedding, save_id, vec)
+    await _index(save_id)
 
 
 async def screen_text_for(save_id):
@@ -765,6 +779,48 @@ async def cmd_toget(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         _short("🎁 Still to get (reply to a save with what you receive):\n\n" + "\n".join(lines)),
         reply_markup=_list_markup([(sid, title) for _, sid, _, _, title in rows[:10]]))
+
+
+# ---------- About Arun + memory test ----------
+
+async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/me <a few lines about yourself> — used to tailor every answer (here and in Claude/ChatGPT)."""
+    text = update.message.text.partition(" ")[2].strip()
+    if text:
+        await asyncio.to_thread(db.set_setting, "profile", text[:2000])
+        await update.message.reply_text("✅ Saved. Every answer will now take this into account.")
+        return
+    now = await asyncio.to_thread(db.get_setting, "profile", "")
+    await update.message.reply_text(
+        (f"About you (used in every answer):\n\n{now}\n\n" if now else "I don't know anything about you yet.\n\n") +
+        "To set or change it, send /me followed by a few lines, e.g.\n"
+        "/me I'm an AR/VR founder in Chennai. I make tech reels. Learning sales and communication. Goal: grow my startup.")
+
+
+def _memtest_text(found, total, misses):
+    pct = round(100 * found / total) if total else 0
+    lines = [f"🧪 Memory test: found {found}/{total} saves ({pct}%) from a real-life question about each."]
+    if misses:
+        lines.append("\nMissed (I'll keep an eye on these):")
+        lines += [f"• #{sid} {title[:50]}\n   asked: {q}" for sid, title, q in misses[:5]]
+    return _short("\n".join(lines))
+
+
+async def cmd_memtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status = await update.message.reply_text("🧪 Testing my memory on 15 random saves… (about 1 minute)")
+    try:
+        await status.edit_text(_memtest_text(*await asyncio.to_thread(memory.memory_test, 15)))
+    except Exception as e:
+        log.exception("memory test failed")
+        await status.edit_text(_friendly_error(e))
+
+
+async def weekly_memtest(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await context.bot.send_message(OWNER, _memtest_text(*await asyncio.to_thread(memory.memory_test, 20)),
+                                       disable_notification=True)
+    except Exception:
+        log.exception("weekly memory test failed")
 
 
 async def daily_backup(context: ContextTypes.DEFAULT_TYPE):
@@ -875,6 +931,9 @@ async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
     try:
         await asyncio.to_thread(db.ping)
         log.info("daily database ping ok")
+        n = await asyncio.to_thread(memory.index_missing)
+        if n:
+            log.info("indexed %s saves that had no search chunks", n)
     except Exception:
         log.exception("daily database ping failed")
 
@@ -894,6 +953,8 @@ async def set_menu(app):
         ("reminders", "Turn daily reminders on/off"),
         ("backup", "Back up all saves now"),
         ("toget", "Resources still to get (comment-for-link)"),
+        ("me", "Tell me about yourself (tailors answers)"),
+        ("memtest", "Test how well I remember your saves"),
         ("help", "How to use me"),
     ])
 
@@ -917,6 +978,8 @@ def build_app():
     app.add_handler(CommandHandler("reminders", cmd_reminders, filters=me))
     app.add_handler(CommandHandler("backup", cmd_backup, filters=me))
     app.add_handler(CommandHandler("toget", cmd_toget, filters=me))
+    app.add_handler(CommandHandler("me", cmd_me, filters=me))
+    app.add_handler(CommandHandler("memtest", cmd_memtest, filters=me))
     app.add_handler(CallbackQueryHandler(on_extra_button, pattern=r"^(st|rs):\d+$"))
     app.add_handler(MessageHandler(me & (filters.VOICE | filters.AUDIO), on_voice))
     app.add_handler(MessageHandler(me & (filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO), on_video))
@@ -937,6 +1000,7 @@ def build_app():
     app.job_queue.run_daily(weekly_recap, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(0,))
     app.job_queue.run_daily(daily_backup, time=dt.time(hour=2, minute=30, tzinfo=IST))
     app.job_queue.run_daily(weekly_backup_file, time=dt.time(hour=9, minute=5, tzinfo=IST), days=(0,))
+    app.job_queue.run_daily(weekly_memtest, time=dt.time(hour=9, minute=10, tzinfo=IST), days=(0,))
     return app
 
 

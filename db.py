@@ -283,6 +283,85 @@ def set_embedding(save_id, embedding):
         c.execute("update saves set embedding = %s where id = %s", (_vec(embedding), save_id))
 
 
+# ---------- chunks: find any sentence of any save ----------
+
+def replace_chunks(save_id, chunks):
+    """chunks: list of (text, embedding). Replaces the save's old chunks in one go."""
+    with _connect() as c:
+        c.execute("delete from chunks where save_id = %s", (save_id,))
+        for i, (text, vec) in enumerate(chunks):
+            c.execute("insert into chunks (save_id, idx, text, embedding) values (%s, %s, %s, %s)",
+                      (save_id, i, text, _vec(vec)))
+
+
+def unindexed_saves():
+    with _connect() as c:
+        return [r[0] for r in c.execute(
+            """select s.id from saves s where s.status = 'done'
+               and not exists (select 1 from chunks k where k.save_id = s.id) order by s.id""")]
+
+
+CHUNK_WEIGHT = 0.98  # a chunk must match about as well as a summary to lift a save (tuned on 66 test questions)
+WORD_BONUS = 0.01    # small boost when the exact words appear (names, tools, terms)
+
+
+def hybrid_search(query, embedding, limit=6, pool=60):
+    """Best saves for a question. Each save is scored by the BETTER of:
+      - how well its summary matches (by meaning), and
+      - how well its single best chunk matches (finds details deep inside long videos),
+    plus a small bonus if the exact words appear in it. Tested: details found 90% vs 65% before,
+    summary-level questions unchanged. Same row shape as search(); 'content' = the best-matching passages."""
+    v = _vec(embedding)
+    with _connect() as c:
+        summary = dict(c.execute(
+            """select id, 1 - (embedding <=> %s) from saves where embedding is not null and status = 'done'
+               order by embedding <=> %s limit %s""", (v, v, pool)).fetchall())
+        best_chunk, chunk_text = {}, {}
+        for sid, text, sim in c.execute(
+                "select save_id, text, 1 - (embedding <=> %s) from chunks order by embedding <=> %s limit %s",
+                (v, v, pool * 3)):
+            if sid not in best_chunk:
+                best_chunk[sid], chunk_text[sid] = sim, text
+        word_text = {}
+        for sid, text in c.execute(
+                """with q as (select to_tsquery('english', replace(plainto_tsquery('english', %s)::text, '&', '|')) as q)
+                   select save_id, text from chunks, q where tsv @@ q.q
+                   order by ts_rank_cd(tsv, q.q, 32) desc limit 30""", (query,)):
+            word_text.setdefault(sid, text)
+        score = {sid: max(summary.get(sid, 0), best_chunk.get(sid, 0) * CHUNK_WEIGHT)
+                      + (WORD_BONUS if sid in word_text else 0)
+                 for sid in set(summary) | set(best_chunk)}
+        top = sorted(score, key=score.get, reverse=True)[:limit]
+        if not top:
+            return []
+        rows = {r[0]: r for r in c.execute(
+            """select id, created_at, source_type, source_url, title, topic, summary, key_points
+               from saves where id = any(%s) and status = 'done'""", (top,))}
+    out = []
+    for sid in top:
+        if sid in rows:
+            passages = list(dict.fromkeys(p for p in (chunk_text.get(sid), word_text.get(sid)) if p))
+            out.append(tuple(rows[sid]) + ("\n…\n".join(passages), float(score[sid])))
+    return out
+
+def eval_question(save_id):
+    with _connect() as c:
+        r = c.execute("select question from eval_questions where save_id = %s", (save_id,)).fetchone()
+        return r[0] if r else None
+
+
+def set_eval_question(save_id, question):
+    with _connect() as c:
+        c.execute("insert into eval_questions values (%s, %s) on conflict (save_id) do update set question = excluded.question",
+                  (save_id, question))
+
+
+def random_done(n):
+    with _connect() as c:
+        return c.execute("""select id, title, summary, key_points from saves where status = 'done'
+                            order by random() limit %s""", (n,)).fetchall()
+
+
 def append_extra(save_id, label, text, point=None):
     """Add a section (screen text, resource, attachment) to a save. Returns the updated row for re-embedding."""
     with _connect() as c:

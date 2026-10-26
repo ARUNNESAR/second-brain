@@ -35,3 +35,22 @@ create table if not exists toget (
     done       boolean not null default false,
     created_at timestamptz not null default now()
 );
+
+-- Search chunks: every save split into small pieces, each findable by meaning (embedding) AND exact words (tsv)
+create table if not exists chunks (
+    id        bigserial primary key,
+    save_id   bigint not null references saves(id) on delete cascade,
+    idx       int not null,
+    text      text not null,
+    embedding vector(768),
+    tsv       tsvector generated always as (to_tsvector('english', text)) stored
+);
+create index if not exists chunks_save_idx on chunks (save_id);
+create index if not exists chunks_embedding_idx on chunks using hnsw (embedding vector_cosine_ops);
+create index if not exists chunks_tsv_idx on chunks using gin (tsv);
+
+-- Memory test: one realistic question per save, reused every week
+create table if not exists eval_questions (
+    save_id  bigint primary key references saves(id) on delete cascade,
+    question text not null
+);

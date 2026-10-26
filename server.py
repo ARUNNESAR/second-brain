@@ -24,6 +24,7 @@ from telegram import Update  # noqa: E402
 
 import brain  # noqa: E402
 import db  # noqa: E402
+import memory  # noqa: E402
 import social  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -38,8 +39,10 @@ mcp = MCPServer(
     name="Arun's Second Brain",
     instructions=(
         "This is Arun's personal knowledge base: notes he saved from YouTube videos, reels, posts, screenshots "
-        "and his own thoughts. When he says 'second brain', 'my saves', 'my notes', or asks something he may have "
-        "saved advice about, call search_my_brain first and base your answer on what it returns. Mention which "
+        "and his own thoughts on sales, communication, career, content creation, productivity, AI tools and more. "
+        "ALWAYS call search_my_brain FIRST for any question about advice, how to do something, what to say, work, "
+        "people, business, content or learning, even if he doesn't mention his saves. Search again with different "
+        "words if the first results don't fit. Then APPLY what he saved to his situation (don't just list it). Mention which "
         "save each point came from (title + date). If saves disagree with each other, show both sides with their dates "
         "(say which is newer) instead of blending them or picking one. If nothing relevant is found, say so before "
         "giving general advice."
@@ -60,24 +63,26 @@ def _fmt(row, excerpt=1500):
     if points:
         out.append("Key points:\n" + "\n".join(f"- {p}" for p in points))
     if content and excerpt:
-        out.append(f"Original (excerpt): {content[:excerpt]}" + ("…" if len(content) > excerpt else ""))
+        label = "Most relevant passages" if excerpt < 60_000 else "Full original"
+        out.append(f"{label}: {content[:excerpt]}" + ("…" if len(content) > excerpt else ""))
     return "\n".join(out)
 
 
 @mcp.tool()
 async def search_my_brain(query: str, limit: int = 6) -> str:
-    """Search Arun's saved notes by meaning (not just keywords).
-    Use for any question he might have saved advice about. Returns the closest saves with summary,
-    key points and an excerpt of the original. Use get_save for the full text of one save."""
+    """Search everything Arun saved, by meaning AND exact words, including details deep inside long videos.
+    Call this first for any advice / how-to / what-to-say / work / business / content question. Returns the best
+    saves with summary, key points and the most relevant passages, plus who Arun is. Use get_save for full text."""
     limit = max(1, min(limit, 15))
-    vec = await asyncio.to_thread(brain.embed, query, True)
-    rows = await asyncio.to_thread(db.search, vec, limit)
+    rows = await asyncio.to_thread(memory.search, query, limit)
+    profile = await asyncio.to_thread(db.get_setting, "profile", "")
     waiting = await asyncio.to_thread(db.queue_size)
     note = (f"\n\n(Note: {waiting} newly shared link(s) are still being processed and aren't searchable yet. "
             f"They usually appear within a few minutes.)") if waiting else ""
     if not rows:
         return "The second brain is empty: nothing saved yet." + note
-    return "\n\n---\n\n".join(_fmt(r) for r in rows) + note
+    about = f"About Arun (tailor the advice to this): {profile}\n\n" if profile else ""
+    return about + "\n\n---\n\n".join(_fmt(r) for r in rows) + note
 
 
 @mcp.tool()
@@ -142,6 +147,10 @@ async def save_to_brain(text_or_link: str) -> str:
     vec = await asyncio.to_thread(brain.embed, brain.note_text_for_search(note))
     i = await asyncio.to_thread(db.add, stype, link, note.title, note.topic, note.summary, note.key_points,
                                 note.content, vec)
+    try:
+        await asyncio.to_thread(memory.index_save, i)  # make every part of it searchable right away
+    except Exception:
+        log.exception("indexing #%s failed (the nightly job retries)", i)
     return f"Saved #{i}: {note.title} (topic: {note.topic})"
 
 
@@ -178,6 +187,8 @@ def create_app():
         global tg_app
         async with inner(a):
             await asyncio.to_thread(db.setup)
+            # index any save that has no search chunks yet (e.g. right after this update), in the background
+            asyncio.get_running_loop().run_in_executor(None, memory.index_missing)
             if WEBHOOK_URL:  # online: start the Telegram bot too
                 import bot
                 tg_app = bot.build_app()

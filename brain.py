@@ -371,6 +371,54 @@ def embed(text, for_query=False):
     return r.embeddings[0].values
 
 
+_embed_log = []  # (time, how many texts) of recent embedding calls
+EMBED_PER_MINUTE = 90  # free plan: 100 texts per minute; stay a little under
+
+
+def _pace(n):
+    """Wait if embedding n more texts now would go over the free per-minute limit."""
+    while True:
+        now = time.time()
+        _embed_log[:] = [(t, k) for t, k in _embed_log if now - t < 60]
+        used = sum(k for _, k in _embed_log)
+        if used + n <= EMBED_PER_MINUTE or not _embed_log:
+            _embed_log.append((now, n))
+            return
+        time.sleep(61 - (now - _embed_log[0][0]))
+
+
+def embed_many(texts, batch=40):
+    """Embeddings for many texts in few requests, paced to the free per-minute limit (retries if it's hit anyway)."""
+    out = []
+    for i in range(0, len(texts), batch):
+        part = [t[:8000] for t in texts[i:i + batch]]
+        for attempt in range(4):
+            _pace(len(part))
+            try:
+                r = client().models.embed_content(
+                    model=EMBED_MODEL, contents=part,
+                    config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM, task_type="RETRIEVAL_DOCUMENT"))
+                break
+            except Exception as e:
+                if "429" not in str(e) or attempt == 3:
+                    raise
+                time.sleep(35)
+        out += [e.values for e in r.embeddings]
+    return out
+
+
+def test_question(title, summary, points):
+    """A realistic question Arun might ask later that THIS save answers (for the weekly memory test).
+    Written like a real-life problem, without copying the title, so the test is honest."""
+    resp = _generate(
+        contents=f"Saved note:\nTitle: {title}\nSummary: {summary}\nPoints: " + "; ".join(points or []),
+        config=types.GenerateContentConfig(system_instruction=(
+            "Write ONE short question (under 20 words) that someone would ask in real life when they need the advice "
+            "in this note. Describe their situation; do not copy the title's words. Reply with the question only.")),
+        models=SAVE_MODELS)
+    return (resp.text or "").strip().strip('"')
+
+
 def note_text_for_search(note):
     return f"{note.title}\nTopic: {note.topic}\n{note.summary}\n" + "\n".join(note.key_points)
 
@@ -418,16 +466,18 @@ Style: plain, friendly English like a smart friend. Short (aim for under 200 wor
 Plain text only: no markdown headings, no ** bold **, no tables."""
 
 
-def answer(question, rows, history="", excerpt=6000):
+def answer(question, rows, history="", excerpt=6000, profile=""):
     """history: the previous question + answer, so follow-ups like 'tell me more' make sense."""
     blocks = []
     for i, r in enumerate(rows, 1):
         _, created, stype, url, title, topic, summary, points, content = r[:9]
         body = f"[{i}] {title} ({stype}, saved {created:%d %b %Y %H:%M}, topic: {topic})\nSummary: {summary}\nKey points:\n- " + "\n- ".join(points or [])
         if content:
-            body += f"\nOriginal (excerpt): {content[:excerpt]}"
+            body += f"\nMost relevant part of the original: {content[:excerpt]}"
         blocks.append(body)
     prev = f"\n\nEarlier in this chat (for context only):\n{history}" if history else ""
+    if profile:  # who Arun is, so advice fits his real situation
+        prev = f"\n\nAbout Arun (use this to tailor the advice):\n{profile}" + prev
     resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + prev + f"\n\nArun's question: {question}",
         config=types.GenerateContentConfig(system_instruction=ANSWER_RULES,
                                            thinking_config=types.ThinkingConfig(thinking_budget=2048)),

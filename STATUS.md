@@ -21,6 +21,8 @@ ChatGPT / Claude (MCP)      ┼→ Render server (second-brain-xbgr.onrender.com
 | Save your own thought | `/note …` in the bot |
 | Ask in Telegram | Type your question to the bot (Gemini answers). Follow-ups like `why?` work. |
 | Ask about ONE save | Reply to its `✅ Saved #12` message with your question |
+| Make answers fit you | `/me` + a few lines about yourself |
+| Check it remembers | `/memtest` (also runs by itself every Sunday) |
 | Pause daily reminders | `/reminders off` (`/reminders on` to restart) |
 | Ask in ChatGPT (PC or phone) | New chat → **+** → turn on **Second Brain** → ask (ChatGPT answers from your notes) |
 | See or back up your saves | `/recent`, `/export` in the bot |
