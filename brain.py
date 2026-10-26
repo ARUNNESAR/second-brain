@@ -676,8 +676,36 @@ def spoken_version(text, limit=900):
     return text
 
 
-def speak(text, voice=MENTOR_VOICE, style="Read this like a calm, friendly mentor talking to a friend, at a slow, "
-                                          "relaxed pace"):
+VOICE_SCRIPT_RULES = """Rewrite this written answer as a short VOICE NOTE that Arun will listen to, like a smart friend
+who has been there talking to him. It is spoken, not read:
+- 80-120 words (about 45 seconds). Short, simple sentences. Contractions (you're, don't, here's).
+- Start straight with the main point for his situation. No greeting, no "great question".
+- Mention at most two mentors naturally by name or video ("Like Simridhi says in her speaking video…"). Never say
+  numbers in brackets, "source", links, or "number one / bullet".
+- If there's an exact line for him to say, say it slowly and clearly: "Try saying: …" then pause.
+- No headings, no lists, no symbols. Use "..." for a natural pause between ideas.
+- End with ONE next step: "So, your move: …"
+Reply with the script only."""
+
+
+def voice_script(question, answer_text):
+    """A listen-friendly script for a voice reply (the written answer has headings and lists that sound robotic)."""
+    try:
+        resp = _generate(contents=f"His question: {question}\n\nWritten answer:\n{answer_text}",
+                         config=types.GenerateContentConfig(system_instruction=VOICE_SCRIPT_RULES), models=SAVE_MODELS)
+        script = (resp.text or "").strip()
+        if script:
+            return script
+    except Exception:
+        pass
+    return spoken_version(answer_text)  # fallback: the written answer, cleaned up
+
+
+VOICE_STYLE = ("Speak this as a warm, relaxed voice note to a close friend: a young man in his mid-twenties, slow and "
+               "natural pace, real pauses at the '...', a little smile in the voice, never like reading an article")
+
+
+def speak(text, voice=MENTOR_VOICE, style=VOICE_STYLE):
     """Text → MP3 bytes (Telegram plays MP3 as a voice note). Needs no ffmpeg."""
     import io as _io
     import wave

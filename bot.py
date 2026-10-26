@@ -619,7 +619,7 @@ async def _send_answer(status, question, only_id=None, previous=None, rows=None,
         _answers[status.message_id] = {"q": question, "only_id": only_id, "text": text, "ids": [r[0] for r in used]}
     await status.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
     if used and markup is not None and await _want_voice(by_voice):
-        asyncio.create_task(_send_voice(brain.spoken_version(text), status.message_id))
+        asyncio.create_task(_voice_answer(question, text, status.message_id))
 
 
 # ---------- voice replies: asked by voice → answered by voice (Puck); "always by voice" / "voice off" ----------
@@ -627,6 +627,12 @@ async def _send_answer(status, question, only_id=None, previous=None, rows=None,
 async def _want_voice(by_voice):
     mode = await asyncio.to_thread(db.get_setting, "voice", "auto")
     return mode == "on" or (mode == "auto" and by_voice)
+
+
+async def _voice_answer(question, text, reply_to_id):
+    """Voice reply = a script written for listening (not the written answer read out), in Puck."""
+    script = await asyncio.to_thread(brain.voice_script, question, text)
+    await _send_voice(script, reply_to_id)
 
 
 async def _send_voice(text, reply_to_id, voice=None, style=None):
