@@ -50,29 +50,46 @@ mcp = MCPServer(
 )
 
 
-def _fmt(row, excerpt=1500):
-    """One saved note as readable text for the AI."""
+def _cut(text, limit):
+    """Shorten at a sentence end, never mid-word."""
+    if len(text) <= limit:
+        return text
+    cut = max(text.rfind(". ", 0, limit), text.rfind("\n", 0, limit))
+    return text[:cut + 1 if cut > limit // 2 else limit].rstrip() + " …"
+
+
+def _fmt(row, excerpt=1200):
+    """One saved note, clean for the AI: what it is, the key advice, and (from search) the passages that matched."""
     i, created, stype, url, title, topic, summary, points, content = row[:9]
-    out = [f"#{i} {title or '(untitled)'}", f"Saved: {created:%d %b %Y} | type: {stype} | topic: {topic or '-'}"]
-    if len(row) > 9 and isinstance(row[9], float):
-        out[1] += f" | relevance: {row[9]:.2f}"
+    where = {"youtube": "YouTube video", "instagram": "Instagram reel", "x": "X post", "linkedin": "LinkedIn post",
+             "reddit": "Reddit post", "image": "screenshot", "note": "Arun's own note", "voice": "Arun's voice note",
+             "pdf": "PDF"}.get(stype, stype)
+    out = [f"[save #{i}] {title or '(untitled)'} ({where}, saved {created:%d %b %Y}, topic: {topic or '-'})"]
     if url:
         out.append(f"Link: {url}")
     if summary:
         out.append(f"Summary: {summary}")
     if points:
-        out.append("Key points:\n" + "\n".join(f"- {p}" for p in points))
+        out.append("Key advice:\n" + "\n".join(f"- {p}" for p in points))
     if content and excerpt:
-        label = "Most relevant passages" if excerpt < 60_000 else "Full original"
-        out.append(f"{label}: {content[:excerpt]}" + ("…" if len(content) > excerpt else ""))
+        if excerpt >= 60_000:
+            out.append(f"Full original:\n{content[:excerpt]}")
+        else:  # search passages: drop the one that only repeats the summary/points above
+            passages = [p.split(": ", 1)[1] if p.startswith(f"{title}: ") else p
+                        for p in content.split("\n…\n") if not p.startswith(f"{title}\nTopic:")]
+            if passages:
+                out.append("What was actually said (the parts that match the question):\n" +
+                           "\n…\n".join(_cut(p, excerpt) for p in passages[:2]))
     return "\n".join(out)
 
 
 @mcp.tool()
 async def search_my_brain(query: str, limit: int = 6) -> str:
-    """Search everything Arun saved, by meaning AND exact words, including details deep inside long videos.
-    Call this first for any advice / how-to / what-to-say / work / business / content question. Returns the best
-    saves with summary, key points and the most relevant passages, plus who Arun is. Use get_save for full text."""
+    """ALWAYS call this FIRST, before answering, whenever Arun asks for advice, how to do something, what to say,
+    or about work, sales, negotiation, communication, career, content, coding, learning or any situation he faces.
+    It searches everything he saved from experts (videos, reels, posts, notes), including details deep inside long
+    videos, and returns the best matches with their key advice and the exact parts that were said. Then answer FROM
+    these saves. Write the query as his situation in plain words. Use get_save for one save's full text."""
     limit = max(1, min(limit, 15))
     rows = await asyncio.to_thread(memory.search, query, limit)
     profile = await asyncio.to_thread(db.get_setting, "profile", "")
@@ -81,8 +98,25 @@ async def search_my_brain(query: str, limit: int = 6) -> str:
             f"They usually appear within a few minutes.)") if waiting else ""
     if not rows:
         return "The second brain is empty: nothing saved yet." + note
-    about = f"About Arun (tailor the advice to this): {profile}\n\n" if profile else ""
-    return about + "\n\n---\n\n".join(_fmt(r) for r in rows) + note
+    head = (f"These are the {len(rows)} saves from Arun's second brain that best match \"{query}\" "
+            "(best match first). They are advice from people he chose to learn from.\n"
+            "HOW TO ANSWER: base your answer on these saves first. Apply their specific techniques, steps and exact "
+            "phrases to his situation; combine several when they fit; name the save you use (e.g. \"from 2 Ways to "
+            "Handle Too Expensive\"). Add your own thinking only after, clearly marked as yours. If none fit, say so "
+            "and search again with other words.\n")
+    if profile:
+        head += f"About Arun: {profile}\n"
+    return head + "\n" + "\n\n---\n\n".join(_fmt(r) for r in rows) + note
+
+
+@mcp.prompt(name="ask_my_second_brain", title="Ask my Second Brain",
+            description="Get advice on a situation from everything you saved")
+def ask_my_second_brain(situation: str) -> str:
+    return (f"My situation: {situation}\n\n"
+            "First call search_my_brain with my situation (and once more with different words if the results don't "
+            "fit). Then answer like a panel of the mentors I saved: the direct answer first; what they would tell me, "
+            "applied to my case with their exact steps and phrases, naming each save; then my next move. Add your own "
+            "view only after, marked as yours.")
 
 
 @mcp.tool()
