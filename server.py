@@ -6,6 +6,7 @@ The MCP address has a secret in it: https://<your-app>.onrender.com/mcp/<MCP_SEC
 Anyone without the secret gets "not found".
 """
 import asyncio
+import re
 import contextlib
 import logging
 import os
@@ -50,6 +51,10 @@ mcp = MCPServer(
 )
 
 
+MATCH_FLOOR = 0.58  # tested: unrelated questions score <= 0.55, real matches >= 0.63
+STRONG_GAP = 0.1    # saves this far below the best match get a short entry only
+
+
 def _cut(text, limit):
     """Shorten at a sentence end, never mid-word."""
     if len(text) <= limit:
@@ -58,7 +63,20 @@ def _cut(text, limit):
     return text[:cut + 1 if cut > limit // 2 else limit].rstrip() + " …"
 
 
-def _fmt(row, excerpt=1200):
+STAMP = re.compile(r"(?<![\d:])\d{1,2}:\d{2}(?::\d{2})?\s+")
+
+
+def _clean(passage):
+    """A passage as readable text: no video timestamps, and no half sentence at the start (chunks overlap)."""
+    passage = STAMP.sub("", passage).strip()
+    if passage[:1].islower():
+        start = min((i for i in (passage.find(". "), passage.find("? "), passage.find("! ")) if 0 <= i < 200),
+                    default=-1)
+        passage = passage[start + 2:] if start >= 0 else "…" + passage
+    return passage
+
+
+def _fmt(row, excerpt=1200, brief=False):
     """One saved note, clean for the AI: what it is, the key advice, and (from search) the passages that matched."""
     i, created, stype, url, title, topic, summary, points, content = row[:9]
     where = {"youtube": "YouTube video", "instagram": "Instagram reel", "x": "X post", "linkedin": "LinkedIn post",
@@ -69,6 +87,8 @@ def _fmt(row, excerpt=1200):
         out.append(f"Link: {url}")
     if summary:
         out.append(f"Summary: {summary}")
+    if brief:
+        return "\n".join(out)
     if points:
         out.append("Key advice:\n" + "\n".join(f"- {p}" for p in points))
     if content and excerpt:
@@ -79,7 +99,7 @@ def _fmt(row, excerpt=1200):
                         for p in content.split("\n…\n") if not p.startswith(f"{title}\nTopic:")]
             if passages:
                 out.append("What was actually said (the parts that match the question):\n" +
-                           "\n…\n".join(_cut(p, excerpt) for p in passages[:2]))
+                           "\n…\n".join(_cut(_clean(p), excerpt) for p in passages[:2]))
     return "\n".join(out)
 
 
@@ -98,15 +118,28 @@ async def search_my_brain(query: str, limit: int = 6) -> str:
             f"They usually appear within a few minutes.)") if waiting else ""
     if not rows:
         return "The second brain is empty: nothing saved yet." + note
-    head = (f"These are the {len(rows)} saves from Arun's second brain that best match \"{query}\" "
-            "(best match first). They are advice from people he chose to learn from.\n"
+    rows = [r for r in rows if r[9] >= MATCH_FLOOR]
+    if not rows:
+        return (f"Nothing in Arun's second brain matches \"{query}\". Tell him plainly that none of his saves "
+                "cover this, then help from your own knowledge (say it's general advice, not from his saves). If the "
+                "words may just be different, search once more with other words first." + note)
+    strong = [r for r in rows if r[9] >= rows[0][9] - STRONG_GAP]
+    weak = rows[len(strong):]
+    head = (f"These are the saves from Arun's second brain that match \"{query}\" (best match first). "
+            "They are advice from people he chose to learn from.\n"
             "HOW TO ANSWER: base your answer on these saves first. Apply their specific techniques, steps and exact "
             "phrases to his situation; combine several when they fit; name the save you use (e.g. \"from 2 Ways to "
-            "Handle Too Expensive\"). Add your own thinking only after, clearly marked as yours. If none fit, say so "
-            "and search again with other words.\n")
+            "Handle Too Expensive\"). Add your own thinking only after, clearly marked as yours. If his question is "
+            "too broad to apply (like \"help me with sales\"), first ask him one short question about his "
+            "situation, offering 2-3 options based on these saves. If none fit, say so and search again with other "
+            "words.\n")
     if profile:
         head += f"About Arun: {profile}\n"
-    return head + "\n" + "\n\n---\n\n".join(_fmt(r) for r in rows) + note
+    body = "\n\n---\n\n".join(_fmt(r) for r in strong)
+    if weak:
+        body += ("\n\n---\n\nLess close, use only if they truly fit (get_save gives the full text):\n\n" +
+                 "\n\n".join(_fmt(r, brief=True) for r in weak))
+    return head + "\n" + body + note
 
 
 @mcp.prompt(name="ask_my_second_brain", title="Ask my Second Brain",
