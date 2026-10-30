@@ -540,6 +540,7 @@ def rerank(question, profile, moves, keep=12):
             config=types.GenerateContentConfig(
                 system_instruction=(
                     f"Pick up to {keep} moves that would genuinely help him in THIS situation, most helpful first. "
+                    "First the moves whose WHEN is the same moment he is in right now, then moves that help with it. "
                     "Judge by usefulness for his exact case, not by shared words. Leave out moves for a different "
                     "situation. Reply with their numbers."),
                 response_mime_type="application/json", response_schema=Ranked),
