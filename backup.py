@@ -4,6 +4,7 @@
   uploads only new or changed saves and removes deleted ones, so the repo grows only by what you actually save
   (~20-40 MB a year), and git history still lets you go back to any day.
   Needs BACKUP_GITHUB_TOKEN (fine-grained token, Contents read/write on that repo only) and BACKUP_REPO.
+- Also his profile/settings and his journey (you/settings.json, you/journal.json).
 - Weekly: one compressed file with everything is sent to Arun in Telegram (bot.py), as a second copy elsewhere.
 """
 import datetime as dt
@@ -25,13 +26,21 @@ def _records():
         "id": r[0], "created_at": r[1].isoformat(), "source_type": r[2], "source_url": r[3], "title": r[4],
         "topic": r[5], "summary": r[6], "key_points": r[7], "content": r[8], "status": r[9],
         "embedding": [round(float(x), 6) for x in r[10].to_list()] if r[10] is not None else None,
+        "proven": r[11], "creator": r[12],
     } for r in db.all_for_backup()]
+
+
+def _you():
+    """His profile/settings and his journey, as backup files."""
+    settings, journal = db.backup_you()
+    return {"you/settings.json": settings, "you/journal.json": journal}
 
 
 def make_file():
     """Everything in one gzipped JSON file (for Telegram and /backup). Returns (bytes, count)."""
     saves = _records()
-    data = {"made_at": dt.datetime.now(IST).isoformat(), "count": len(saves), "saves": saves}
+    data = {"made_at": dt.datetime.now(IST).isoformat(), "count": len(saves), "saves": saves,
+            "you": {p.split("/")[1][:-5]: v for p, v in _you().items()}}
     return gzip.compress(json.dumps(data, ensure_ascii=False).encode("utf-8")), len(saves)
 
 
@@ -57,6 +66,8 @@ def to_github():
         return None
     files = {f"saves/{s['id']:05d}.json": json.dumps(s, ensure_ascii=False, indent=1).encode("utf-8")
              for s in _records()}
+    n_saves = len(files)
+    files.update({p: json.dumps(v, ensure_ascii=False, indent=1).encode("utf-8") for p, v in _you().items()})
 
     try:
         head = _api("GET", "git/ref/heads/main")["object"]["sha"]
@@ -71,7 +82,7 @@ def to_github():
     changed = {p: c for p, c in files.items() if current.get(p) != _blob_sha(c)}
     removed = [p for p in current if p.startswith("saves/") and p not in files]
     if not changed and not removed:
-        return 0, 0, len(files)
+        return 0, 0, n_saves
 
     tree = [{"path": p, "mode": "100644", "type": "blob", "content": c.decode("utf-8")} for p, c in changed.items()]
     tree += [{"path": p, "mode": "100644", "type": "blob", "sha": None} for p in removed]
@@ -79,10 +90,10 @@ def to_github():
     if base_tree:
         body["base_tree"] = base_tree
     new_tree = _api("POST", "git/trees", body)["sha"]
-    msg = f"Backup {dt.datetime.now(IST):%Y-%m-%d}: {len(changed)} new/changed, {len(removed)} removed, {len(files)} total"
+    msg = f"Backup {dt.datetime.now(IST):%Y-%m-%d}: {len(changed)} new/changed, {len(removed)} removed, {n_saves} saves"
     commit = _api("POST", "git/commits", {"message": msg, "tree": new_tree, "parents": [head] if head else []})["sha"]
     if head:
         _api("PATCH", "git/refs/heads/main", {"sha": commit})
     else:
         _api("POST", "git/refs", {"ref": "refs/heads/main", "sha": commit})
-    return len(changed), len(removed), len(files)
+    return len(changed), len(removed), n_saves

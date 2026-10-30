@@ -462,7 +462,19 @@ def all_for_backup():
     with _connect() as c:
         return c.execute(
             """select id, created_at, source_type, source_url, title, topic, summary, key_points, content, status,
-                      embedding from saves where status <> 'deleted' order by id""").fetchall()
+                      embedding, proven, creator from saves where status <> 'deleted' order by id""").fetchall()
+
+
+def backup_you():
+    """Everything about Arun himself (not his saves): settings incl. his profile, and his journey (real
+    situations and how they went). Small; mentor moves and review dates are left out (rebuilt from the saves)."""
+    with _connect() as c:
+        settings = dict(c.execute("select key, value from settings order by key").fetchall())
+        journal = [{"id": r[0], "at": r[1].isoformat(), "situation": r[2], "advice": r[3], "save_ids": r[4],
+                    "result": r[5], "outcome": r[6]}
+                   for r in c.execute("""select id, at, situation, advice, save_ids, result, outcome
+                                         from journal order by id""").fetchall()]
+    return settings, journal
 
 
 def soft_delete(save_id):
