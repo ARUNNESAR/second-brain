@@ -138,11 +138,13 @@ def mentor_context(question, saves=6, moves=15, profile=""):
         except Exception:  # quota or a bad reply: search with his own words only
             log.exception("query plan failed")
             plan = None
-    queries = [question] + (plan.situations if plan else [])
+    english = plan.english.strip() if plan and plan.english else ""
+    own = [question] + ([english] if english and english.lower() != question.lower() else [])  # his words (+ English)
+    queries = own + (plan.situations if plan else [])
     vecs = [v] + (brain.embed_many(queries[1:], for_query=True) if len(queries) > 1 else [])
     mentor = plan.mentor if plan and plan.mentor in mentors else ""
-    found = db.search_moves_multi(queries, vecs, 60, creator=mentor)
-    direct = max((m[13] or 0 for m in found), default=0)  # best match for his OWN words: off-topic check
+    found = db.search_moves_multi(queries, vecs, 60, creator=mentor, own=len(own))
+    direct = max((m[13] or 0 for m in found), default=0)  # best match for his own words (or their English): off-topic check
     pool, per = [], {}
     for m in found:
         per[m[0]] = per.get(m[0], 0) + 1

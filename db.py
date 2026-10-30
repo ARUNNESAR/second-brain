@@ -679,10 +679,11 @@ def review_mark(move_id, knew_it):
 
 
 
-def search_moves_multi(queries, embeddings, pool=40, creator=""):
+def search_moves_multi(queries, embeddings, pool=40, creator="", own=1):
     """search_moves for several wordings of one question in ONE database round trip (each round trip to the
     database costs ~0.3-1 s). Each move keeps its best score over the wordings; the extra last column 'direct' is
-    its score for the first wording (his own words), used to tell real matches from off-topic questions."""
+    its best score for the first own wordings (his own words, and their faithful English translation), used to tell
+    real matches from off-topic questions."""
     vecs = [str(list(e)) for e in embeddings]
     with _connect() as c:
         return c.execute(
@@ -693,23 +694,31 @@ def search_moves_multi(queries, embeddings, pool=40, creator=""):
                                + case when m.tsv @@ to_tsquery('english', replace(
                                    plainto_tsquery('english', qs.qt)::text, '&', '|')) then %s else 0 end as sc
                         from moves m cross join qs),
-                     best as (select mid, max(sc) as sc, max(sc) filter (where k = 0) as direct
+                     best as (select mid, max(sc) as sc, max(sc) filter (where k < %s) as direct
                               from scored group by mid)
                 select {MOVE_COLS.format(score="best.sc + case when s.proven then %s else 0 end")}, best.direct
                 from best join moves m on m.id = best.mid join saves s on s.id = m.save_id
                 where s.status = 'done' and (%s = '' or s.creator ilike %s)
                 order by best.sc desc limit %s""",
-            (list(range(len(queries))), list(queries), vecs, WORD_BONUS, PROVEN_BONUS,
+            (list(range(len(queries))), list(queries), vecs, WORD_BONUS, own, PROVEN_BONUS,
              creator, f"%{_like(creator)}%", pool)).fetchall()
 
 
 def mentor_extras(save_ids, embedding):
-    """In ONE round trip: the saves the chosen moves come from (in that order, same row shape as hybrid_search but
-    without passages) and his past similar situations (like similar_journal)."""
+    """In ONE round trip: the saves the chosen moves come from (in that order, same row shape as hybrid_search:
+    'content' = the 2 passages of each save that best match his question, the creator's actual words) and his past
+    similar situations (like similar_journal)."""
     v = _vec(embedding)
     with _connect() as c:
-        rows = {r[0]: r for r in c.execute(
-            """select id, created_at, source_type, source_url, title, topic, summary, key_points, ''
+        passages = {}
+        for sid, text in c.execute(
+                """select save_id, text from (
+                       select save_id, text, idx, row_number() over (partition by save_id order by embedding <=> %s) as r
+                       from chunks where save_id = any(%s) and idx > 0) t
+                   where r <= 2 order by save_id, idx""", (v, list(save_ids))).fetchall():
+            passages.setdefault(sid, []).append(text)
+        rows = {r[0]: r[:8] + ("\n…\n".join(passages.get(r[0], [])),) for r in c.execute(
+            """select id, created_at, source_type, source_url, title, topic, summary, key_points
                from saves where id = any(%s) and status = 'done'""", (list(save_ids),)).fetchall()}
         past = [r[:5] for r in c.execute(
             """select at, situation, advice, result, outcome, 1 - (embedding <=> %s) as s from journal

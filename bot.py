@@ -710,6 +710,9 @@ async def _answer(question, only_id=None, previous=None, rows=None):
         excerpt = 30000 if only_id else (3000 if moves else (12000 if previous else 6000))
         text = await asyncio.to_thread(brain.answer, question, rows, history, excerpt, profile, previous,
                                        moves, ctx.get("past"), ctx.get("mentors"))
+        if moves and rows:  # second pass: is everything it credits to his saves really in them?
+            text = await asyncio.to_thread(brain.check_answer, question, text, rows, moves)
+        text = re.sub(r"\s*\b(Backup:|Avoid:|Your next step:|My take:)", r"\n\n\1", text.replace("\\n", "\n")).strip()  # easy to scan
         _last_qa.update(at=time.time(), q=question, a=text, id=only_id)
         plan = ctx.get("plan")
         if plan and plan.real_situation and covered and not previous and not history:  # a real moment: ask later how it went
@@ -756,7 +759,7 @@ def _retry_button(mid):
 async def respond(reply_to, question, only_id=None, ask_first=True, by_voice=False):
     """Answer a question in the chat. Like a good coach, it may first ask ONE quick question when the right advice
     depends on a missing detail; then the answer comes with 👍 / 👎 (👎 = try again, harder)."""
-    status = await reply_to.reply_text("🔎 Looking through your saves…")
+    status = await reply_to.reply_text("🔎 Thinking it through with your saves, then double-checking the answer… (about a minute)")
     rows = None
     recent = time.time() - _last_qa["at"] < FOLLOW_UP_SECONDS
     if ask_first and not only_id and not (recent and len(question) < 60):  # never for follow-ups
@@ -1868,6 +1871,21 @@ async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
         log.exception("daily database ping failed")
 
 
+async def night_check(context: ContextTypes.DEFAULT_TYPE):
+    """8:30 AM: the server sleeps 1:30-6:30 AM (keepalive.sql). Telegram keeps night messages and delivers them when
+    it wakes; if any are still stuck by now, tell him instead of losing them silently."""
+    try:
+        info = await context.bot.get_webhook_info()
+        if info.last_error_date:
+            log.info("telegram delivery error at %s: %s (pending %s)", info.last_error_date, info.last_error_message,
+                     info.pending_update_count)
+        if info.pending_update_count:
+            await context.bot.send_message(OWNER, f"⚠️ {info.pending_update_count} of your messages didn't reach me "
+                                                  f"yet. Please send them again.")
+    except Exception:
+        log.exception("night check failed")
+
+
 async def set_menu(app):
     # Steve Jobs rule: no commands to learn. The menu shows only 4; everything else is plain words (old commands
     # still work if typed). Also keep the bot handle so background jobs can react with emoji.
@@ -1930,6 +1948,7 @@ def build_app():
 
     app.job_queue.run_daily(daily_ping, time=dt.time(hour=3, minute=0))
     app.job_queue.run_once(daily_ping, when=5)
+    app.job_queue.run_daily(night_check, time=dt.time(hour=8, minute=30, tzinfo=IST))
     app.job_queue.run_repeating(queue_tick, interval=10 * 60, first=30)
     app.job_queue.run_repeating(followups, interval=30 * 60, first=120)  # "how did it go?" (10 AM - 9 PM only)
     # Daily reminder Mon-Sat 9:00 AM India time; Sunday 9:00 AM is the weekly recap instead (0 = Sunday)

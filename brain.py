@@ -1,7 +1,9 @@
 """The thinking part: Gemini reads videos/images, writes notes, makes embeddings, answers questions."""
 import json
+import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -10,6 +12,8 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel
 from youtube_transcript_api import YouTubeTranscriptApi
+
+log = logging.getLogger(__name__)
 
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 EMBED_MODEL = "gemini-embedding-001"
@@ -28,7 +32,16 @@ _client = None
 _used_up = {}  # model -> time until which we skip it (its daily free quota ran out)
 
 
+_client_lock = threading.Lock()
+
+
 def client():
+    global _client
+    with _client_lock:  # two threads creating it at once left one using a closed connection (seen Oct 31)
+        return _client or _make_client()
+
+
+def _make_client():
     global _client
     if _client is None:
         # Without a timeout a stuck request can hang forever; 4 min is enough for a 1-hour video.
@@ -503,6 +516,7 @@ class QueryPlan(BaseModel):
     real_situation: bool   # true if he is facing (or about to face) a real situation, not asking a fact or a summary
     summary: str           # his situation in under 15 words, e.g. "School principal said too costly, will think"
     mentor: str            # a mentor he names ("what would Hormozi say"), exactly as in the list; else ""
+    english: str           # his message faithfully in plain English (Tanglish/Tamil translated), same meaning
 
 
 def plan_query(question, mentors=()):
@@ -518,8 +532,10 @@ def plan_query(question, mentors=()):
                 "change what he is asking about; if it is a plain question (not a life situation), the 3 lines just "
                 "restate it in different words. real_situation: true only if he describes something happening in his "
                 "own life or work. summary: his situation in under 15 words. mentor: if he asks what a specific "
-                "person would say or wants advice from one person, that person's name from the list; else \"\"."),
-            response_mime_type="application/json", response_schema=QueryPlan),
+                "person would say or wants advice from one person, that person's name from the list; else \"\". "
+                "english: his message translated faithfully into plain English (same meaning, nothing added)."),
+            response_mime_type="application/json", response_schema=QueryPlan,
+            thinking_config=types.ThinkingConfig(thinking_budget=1024)),
         models=SAVE_MODELS)
     p = resp.parsed or QueryPlan(**json.loads(resp.text))
     p.situations = [s for s in p.situations if s.strip()][:3]
@@ -533,7 +549,8 @@ class Ranked(BaseModel):
 def rerank(question, profile, moves, keep=12):
     """A second look: of the candidate moves (found because they SOUND similar), which would actually help him right
     now? Returns the moves reordered (its picks first, then the rest), most useful first; the given order if it fails."""
-    listing = "\n".join(f"{k}. WHEN: {m[1]} | DO: {m[2][:200]}" for k, m in enumerate(moves, 1))
+    listing = "\n".join(f"{k}. WHEN: {m[1]} | DO: {m[2]}" + (f' | SAY: "{m[3]}"' if m[3] else "")
+                        + (f" | AVOID: {m[5]}" if m[5] else "") for k, m in enumerate(moves, 1))
     try:
         resp = _generate(
             contents=f"About Arun: {profile or 'unknown'}\n\nHis message: {question}\n\nCandidate moves:\n{listing}",
@@ -543,7 +560,8 @@ def rerank(question, profile, moves, keep=12):
                     "First the moves whose WHEN is the same moment he is in right now, then moves that help with it. "
                     "Judge by usefulness for his exact case, not by shared words. Leave out moves for a different "
                     "situation. Reply with their numbers."),
-                response_mime_type="application/json", response_schema=Ranked),
+                response_mime_type="application/json", response_schema=Ranked,
+                thinking_config=types.ThinkingConfig(thinking_budget=1024)),  # think first: better order
             models=SAVE_MODELS)
         best = (resp.parsed or Ranked(**json.loads(resp.text))).best
         picked = [moves[k - 1] for k in dict.fromkeys(best) if 0 < k <= len(moves)]
@@ -595,6 +613,7 @@ Decide; don't summarise the notes or list everything.
 
 How to answer:
 1. "Do this:" the single best move, applied to his exact case, with the exact words to say when there are any.
+   Adapt the creator's line to his case (his client, rupees not dirhams/dollars), keeping what makes it work.
 2. "Backup:" one other move that fits, in case the first doesn't land. Skip it if none truly fits.
 3. "Avoid:" the one mistake to dodge here, from the notes when possible.
 4. "Your next step:" one small, concrete action he can do today. He is building confidence, so make it doable.
@@ -620,7 +639,8 @@ def past_block(past):
 
 ANSWER_RULES = MENTOR_RULES + """
 Cite saves like [1] (the number of the save in the list). Style: plain, friendly English, like a mentor who has been
-there. Under 200 words. Plain text only: no markdown headings, no ** bold **, no tables."""
+there. Under 200 words. Plain text only: no markdown headings, no ** bold **, no tables. Start each part ("Do this:",
+"Backup:", "Avoid:", "Your next step:") on a new line with a blank line before it."""
 
 
 def moves_block(moves, number_of=None):
@@ -675,10 +695,50 @@ def answer(question, rows, history="", excerpt=6000, profile="", previous=None, 
         prev += "\n\nMentors he already follows: " + ", ".join(mentors)
     resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + prev + f"\n\nArun's question: {question}",
         config=types.GenerateContentConfig(system_instruction=rules, thinking_config=types.ThinkingConfig(
-            thinking_budget=8192 if previous else 2048)),
+            thinking_budget=8192 if previous else 4096)),
         models=ANSWER_MODELS,  # the best models first: reasoning quality matters most here
     )
     return (resp.text or "").strip()
+
+
+class Check(BaseModel):
+    ok: bool              # true if the answer is faithful to the notes and fits his situation
+    problems: list[str]   # what is wrong, if anything
+    fixed: str            # the corrected answer (same format and length); "" if ok
+
+
+CHECK_RULES = """You are the fact-checker for Arun's mentor. Compare the ANSWER with the MOVES and NOTES it was
+written from. Problems to catch:
+1. Advice, numbers, names or quoted lines credited to a save or mentor that are NOT in the moves/notes (made up or
+   twisted). Fix: correct it from the notes, or move it under "My take:".
+2. It contradicts the notes, or gives the opposite of what a mentor said.
+Choosing WHICH move to recommend is not your job: never swap moves.
+"Your next step" and "My take" are the mentor's own suggestions: they don't need to be in the notes; only check
+they don't contradict them. Do NOT nitpick style, wording or length, and don't add new advice. If there is no real
+problem, ok = true.
+If you fix it, keep the same format (each section on its own line), tone, citations [n] and length."""
+
+
+def check_answer(question, text, rows, moves):
+    """Second pass on every answer: is everything it credits to his saves really in them? Returns the answer,
+    corrected only when a real problem was found (a checker that rewrites good answers makes them worse)."""
+    notes = "\n\n".join(f"[{i}] {r[4]}: {r[6]}\n- " + "\n- ".join(r[7] or []) + (f"\n{r[8][:2000]}" if r[8] else "")
+                        for i, r in enumerate(rows, 1))
+    try:
+        resp = _generate(
+            contents=(f"His message: {question}\n\nMOVES:\n{moves_block(moves, {r[0]: i for i, r in enumerate(rows, 1)})}"
+                      f"\n\nNOTES:\n{notes}\n\nANSWER:\n{text}"),
+            config=types.GenerateContentConfig(system_instruction=CHECK_RULES, response_mime_type="application/json",
+                                               response_schema=Check,
+                                               thinking_config=types.ThinkingConfig(thinking_budget=2048)),
+            models=SAVE_MODELS)
+        c = resp.parsed or Check(**json.loads(resp.text))
+        if not c.ok and c.problems and len(c.fixed) > len(text) // 2:
+            log.info("answer corrected: %s", "; ".join(c.problems)[:300])
+            return c.fixed.replace("\\n", "\n").strip()  # some replies come with escaped line breaks
+    except Exception:
+        log.exception("answer check failed; keeping the answer")
+    return text
 
 
 class Clarify(BaseModel):
