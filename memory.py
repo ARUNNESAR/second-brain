@@ -7,6 +7,7 @@
 """
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import brain
 import db
@@ -126,17 +127,19 @@ def mentor_context(question, saves=6, moves=15, profile=""):
     2. search moves with his words AND the 3 rewrites, keep each move's best score;
     3. second look: re-rank the top 40 by "would this actually help him now";
     4. add his past similar situations and how they went.
-    Returns (saves, moves, ctx) - saves: of the top moves first, then the best-matching saves;
-    ctx: {"plan", "past", "mentors", "vector"}."""
+    Returns (saves, moves, ctx) - saves: the ones the chosen moves come from, best first;
+    ctx: {"plan", "past", "mentors", "vector", "direct" (best score for his own words: off-topic check)}."""
     mentors = _mentors()
-    try:
-        plan = brain.plan_query(question, mentors)
-    except Exception:  # quota or a bad reply: search with his own words only
-        log.exception("query plan failed")
-        plan = None
+    with ThreadPoolExecutor(2) as ex:  # understanding his words and embedding them happen at the same time
+        planning = ex.submit(brain.plan_query, question, mentors)
+        v = ex.submit(brain.embed, question, True).result()
+        try:
+            plan = planning.result()
+        except Exception:  # quota or a bad reply: search with his own words only
+            log.exception("query plan failed")
+            plan = None
     queries = [question] + (plan.situations if plan else [])
-    vecs = brain.embed_many(queries, for_query=True)
-    v = vecs[0]
+    vecs = [v] + (brain.embed_many(queries[1:], for_query=True) if len(queries) > 1 else [])
     mentor = plan.mentor if plan and plan.mentor in mentors else ""
     found = db.search_moves_multi(queries, vecs, 60, creator=mentor)
     direct = max((m[13] or 0 for m in found), default=0)  # best match for his OWN words: off-topic check
@@ -146,17 +149,13 @@ def mentor_context(question, saves=6, moves=15, profile=""):
         if per[m[0]] <= 3 and len(pool) < 40:  # max 3 per save: one long podcast can't crowd out the rest
             pool.append(m)
     found_moves = brain.rerank(question, profile, pool, keep=moves) if len(pool) > 3 else pool
-    rows = db.hybrid_search(question, v, saves)
-    past = db.similar_journal(v)
-    have = {r[0] for r in rows}
-    extra = []
-    for sid in dict.fromkeys(m[0] for m in found_moves[:6]):
-        if sid not in have:
-            row = db.get(sid)
-            if row:
-                extra.append(tuple(row) + (max(m[6] for m in found_moves if m[0] == sid),))
-    return extra + rows, found_moves, {"plan": plan, "past": past, "mentors": mentors, "vector": v, "direct": direct}
-
+    save_ids = list(dict.fromkeys(m[0] for m in found_moves))[:saves]
+    rows, past = db.mentor_extras(save_ids, v)
+    best = {}
+    for m in found_moves:
+        best[m[0]] = max(best.get(m[0], 0), m[6])
+    rows = [tuple(r) + (best[r[0]],) for r in rows]
+    return rows, found_moves, {"plan": plan, "past": past, "mentors": mentors, "vector": v, "direct": direct}
 
 _mentor_cache = {"at": 0, "names": []}
 

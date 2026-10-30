@@ -704,9 +704,12 @@ async def _answer(question, only_id=None, previous=None, rows=None):
         if not rows:
             return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me.", None, []
         covered = ctx.get("direct", 1) >= memory.MOVE_FLOOR
+        found = rows  # returned for the 👍/👎 buttons either way
+        if not covered:  # nothing he saved fits: the mentor says so and points to who to learn from
+            rows, moves = [], None
         excerpt = 30000 if only_id else (3000 if moves else (12000 if previous else 6000))
         text = await asyncio.to_thread(brain.answer, question, rows, history, excerpt, profile, previous,
-                                       moves if covered else None, ctx.get("past"), ctx.get("mentors"))
+                                       moves, ctx.get("past"), ctx.get("mentors"))
         _last_qa.update(at=time.time(), q=question, a=text, id=only_id)
         plan = ctx.get("plan")
         if plan and plan.real_situation and covered and not previous and not history:  # a real moment: ask later how it went
@@ -721,7 +724,7 @@ async def _answer(question, only_id=None, previous=None, rows=None):
             if r[3]:
                 line += f"\n     {r[3]}"
             sources.append(line)
-        return _short(text + ("\n\n📚 From your saves:\n" + "\n".join(sources) if sources else "")), None, rows
+        return _short(text + ("\n\n📚 From your saves:\n" + "\n".join(sources) if sources else "")), None, found
     except Exception as e:
         log.exception("ask failed")
         s = str(e)
@@ -1638,6 +1641,16 @@ async def _streak():
     return n if alive else 0
 
 
+async def _daily_done(add=False):
+    """How many DAILY review cards he did today (quizzes on one save don't count). add=True: one more."""
+    day, _, n = (await asyncio.to_thread(db.get_setting, "review_today", "") or "").partition(":")
+    n = int(n) if day == str(_today()) and n.isdigit() else 0
+    if add:
+        n += 1
+        await asyncio.to_thread(db.set_setting, "review_today", f"{_today()}:{n}")
+    return n
+
+
 async def _bump_streak():
     today = str(_today())
     last = await asyncio.to_thread(db.get_setting, "review_last", "")
@@ -1652,7 +1665,7 @@ async def _bump_streak():
 async def send_review_card(bot, where, after_move=None):
     """where: "d" = daily review, or a save id = quiz on that one save."""
     if where == "d":
-        done = await asyncio.to_thread(db.reviewed_today)
+        done = await _daily_done()
         if done >= REVIEW_CARDS:
             streak = await _bump_streak()
             await bot.send_message(OWNER, f"✅ Done for today!" + (f" 🔥 {streak}-day streak." if streak > 1 else "")
@@ -1705,6 +1718,8 @@ async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔁 Not yet", callback_data=f"rv:no:{move_id}:{where}")]]))
     else:
         await asyncio.to_thread(db.review_mark, move_id, act == "ok")
+        if where == "d":
+            await _daily_done(add=True)
         await q.edit_message_reply_markup(None)
         await send_review_card(context.bot, where, after_move=move_id)
 
@@ -1920,7 +1935,8 @@ def build_app():
     # Daily reminder Mon-Sat 9:00 AM India time; Sunday 9:00 AM is the weekly recap instead (0 = Sunday)
     app.job_queue.run_daily(daily_tip, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(1, 2, 3, 4, 5, 6))
     app.job_queue.run_daily(weekly_recap, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(0,))
-    app.job_queue.run_daily(daily_backup, time=dt.time(hour=2, minute=30, tzinfo=IST))
+    # 12:45 AM: before the server's nightly sleep (1:30-6:30 AM, see keepalive.sql)
+    app.job_queue.run_daily(daily_backup, time=dt.time(hour=0, minute=45, tzinfo=IST))
     app.job_queue.run_daily(weekly_backup_file, time=dt.time(hour=9, minute=5, tzinfo=IST), days=(0,))
     app.job_queue.run_daily(weekly_memtest, time=dt.time(hour=9, minute=10, tzinfo=IST), days=(0,))
     return app

@@ -532,7 +532,7 @@ class Ranked(BaseModel):
 
 def rerank(question, profile, moves, keep=12):
     """A second look: of the candidate moves (found because they SOUND similar), which would actually help him right
-    now? Returns the moves reordered, most useful first. Falls back to the given order if it fails."""
+    now? Returns the moves reordered (its picks first, then the rest), most useful first; the given order if it fails."""
     listing = "\n".join(f"{k}. WHEN: {m[1]} | DO: {m[2][:200]}" for k, m in enumerate(moves, 1))
     try:
         resp = _generate(
@@ -546,7 +546,8 @@ def rerank(question, profile, moves, keep=12):
             models=SAVE_MODELS)
         best = (resp.parsed or Ranked(**json.loads(resp.text))).best
         picked = [moves[k - 1] for k in dict.fromkeys(best) if 0 < k <= len(moves)]
-        return picked or moves[:keep]
+        # its picks go first, the rest follow by similarity: a re-ranker that only filters drops good moves (tested)
+        return (picked + [m for m in moves if m not in picked])[:keep]
     except Exception:
         return moves[:keep]
 

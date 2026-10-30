@@ -521,7 +521,7 @@ def saves_without_moves(limit=10):
 
 
 MOVE_COLS = """m.save_id, m.situation, m.move, m.say, m.why, m.avoid, {score}, s.title, s.source_type, s.created_at,
-               s.source_url, m.id, s.creator"""
+               s.source_url, m.id, coalesce(nullif(s.creator, '-'), '')"""
 
 
 def search_moves(query, embedding, limit=15, per_save=3, pool=120, creator=""):
@@ -678,10 +678,6 @@ def review_mark(move_id, knew_it):
                   (move_id, box, REVIEW_DAYS[box - 1]))
 
 
-def reviewed_today():
-    with _connect() as c:
-        return c.execute("select count(*) from move_reviews where last_at = current_date").fetchone()[0]
-
 
 def search_moves_multi(queries, embeddings, pool=40, creator=""):
     """search_moves for several wordings of one question in ONE database round trip (each round trip to the
@@ -705,3 +701,17 @@ def search_moves_multi(queries, embeddings, pool=40, creator=""):
                 order by best.sc desc limit %s""",
             (list(range(len(queries))), list(queries), vecs, WORD_BONUS, PROVEN_BONUS,
              creator, f"%{_like(creator)}%", pool)).fetchall()
+
+
+def mentor_extras(save_ids, embedding):
+    """In ONE round trip: the saves the chosen moves come from (in that order, same row shape as hybrid_search but
+    without passages) and his past similar situations (like similar_journal)."""
+    v = _vec(embedding)
+    with _connect() as c:
+        rows = {r[0]: r for r in c.execute(
+            """select id, created_at, source_type, source_url, title, topic, summary, key_points, ''
+               from saves where id = any(%s) and status = 'done'""", (list(save_ids),)).fetchall()}
+        past = [r[:5] for r in c.execute(
+            """select at, situation, advice, result, outcome, 1 - (embedding <=> %s) as s from journal
+               where embedding is not null order by embedding <=> %s limit 3""", (v, v)).fetchall() if r[5] >= 0.72]
+    return [rows[i] for i in save_ids if i in rows], past
