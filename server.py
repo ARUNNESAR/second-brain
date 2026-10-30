@@ -52,7 +52,7 @@ mcp = MCPServer(
 
 
 MATCH_FLOOR = 0.58  # tested: unrelated questions score <= 0.55, real matches >= 0.63
-STRONG_GAP = 0.1    # saves this far below the best match get a short entry only
+MOVE_FLOOR = 0.63   # tested: off-topic questions' best move <= 0.62, real situations >= 0.67
 
 
 def _cut(text, limit):
@@ -111,7 +111,7 @@ async def search_my_brain(query: str, limit: int = 6) -> str:
     videos, and returns the best matches with their key advice and the exact parts that were said. Then answer FROM
     these saves. Write the query as his situation in plain words. Use get_save for one save's full text."""
     limit = max(1, min(limit, 15))
-    rows = await asyncio.to_thread(memory.search, query, limit)
+    rows, moves = await asyncio.to_thread(memory.mentor_context, query, limit)
     profile = await asyncio.to_thread(db.get_setting, "profile", "")
     waiting = await asyncio.to_thread(db.queue_size)
     note = (f"\n\n(Note: {waiting} newly shared link(s) are still being processed and aren't searchable yet. "
@@ -119,27 +119,20 @@ async def search_my_brain(query: str, limit: int = 6) -> str:
     if not rows:
         return "The second brain is empty: nothing saved yet." + note
     rows = [r for r in rows if r[9] >= MATCH_FLOOR]
-    if not rows:
-        return (f"Nothing in Arun's second brain matches \"{query}\". Tell him plainly that none of his saves "
-                "cover this, then help from your own knowledge (say it's general advice, not from his saves). If the "
-                "words may just be different, search once more with other words first." + note)
-    strong = [r for r in rows if r[9] >= rows[0][9] - STRONG_GAP]
-    weak = rows[len(strong):]
-    head = (f"These are the saves from Arun's second brain that match \"{query}\" (best match first). "
-            "They are advice from people he chose to learn from.\n"
-            "HOW TO ANSWER: base your answer on these saves first. Apply their specific techniques, steps and exact "
-            "phrases to his situation; combine several when they fit; name the save you use (e.g. \"from 2 Ways to "
-            "Handle Too Expensive\"). Add your own thinking only after, clearly marked as yours. If his question is "
-            "too broad to apply (like \"help me with sales\"), first ask him one short question about his "
-            "situation, offering 2-3 options based on these saves. If none fit, say so and search again with other "
-            "words.\n")
-    if profile:
-        head += f"About Arun: {profile}\n"
-    body = "\n\n---\n\n".join(_fmt(r) for r in strong)
-    if weak:
-        body += ("\n\n---\n\nLess close, use only if they truly fit (get_save gives the full text):\n\n" +
-                 "\n\n".join(_fmt(r, brief=True) for r in weak))
-    return head + "\n" + body + note
+    moves = [m for m in moves if m[6] >= MOVE_FLOOR]
+    if not moves:  # every save is broken into moves, so no fitting move = nothing he saved covers this
+        return (f"Nothing in Arun's second brain matches \"{query}\". If the words may just be different, search once "
+                "more with other words. Otherwise tell him \"Your saves don't cover this.\", give your best advice "
+                "marked as yours, and name 1-2 specific, well-known people, books or podcasts known for exactly this, "
+                "for him to learn from and save next." + note)
+    about = f"About Arun: {profile}\n\n" if profile else ""
+    return (f"Arun's second brain: the mentor moves that best fit \"{query}\", out of everything he saved.\n\n"
+            f"HOW TO ANSWER, as his mentor:\n{brain.MENTOR_RULES}\n"
+            "If his question is too broad to pick a move (like \"help me with sales\"), first ask him one short "
+            "question about his situation, with 2-3 options based on these moves.\n\n"
+            f"{about}CANDIDATE MOVES (best fit first; most won't fit, choose):\n{brain.moves_block(moves)}\n\n"
+            "THE SAVES THEY COME FROM (get_save gives one save's full text):\n\n" +
+            "\n\n".join(_fmt(r, brief=True) for r in rows) + note)
 
 
 @mcp.prompt(name="ask_my_second_brain", title="Ask my Second Brain",
@@ -147,9 +140,9 @@ async def search_my_brain(query: str, limit: int = 6) -> str:
 def ask_my_second_brain(situation: str) -> str:
     return (f"My situation: {situation}\n\n"
             "First call search_my_brain with my situation (and once more with different words if the results don't "
-            "fit). Then answer like a panel of the mentors I saved: the direct answer first; what they would tell me, "
-            "applied to my case with their exact steps and phrases, naming each save; then my next move. Add your own "
-            "view only after, marked as yours.")
+            "fit). Then be my mentor: pick the 1-3 moves that fit my exact case and tell me what to do (Do this / "
+            "Backup / Avoid / Your next step), naming where each move came from. Your own view only after, marked "
+            "as yours.")
 
 
 @mcp.tool()

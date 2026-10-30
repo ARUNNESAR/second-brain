@@ -661,6 +661,7 @@ async def _answer(question, only_id=None, previous=None, rows=None):
         if recent and not only_id and not previous and _last_qa["id"] and len(question) <= 40 and FOLLOW_UP_RE.search(question):
             only_id = _last_qa["id"]  # short follow-up after asking about one save: stay on that save
         history = f"Q: {_last_qa['q']}\nA: {_last_qa['a'][:1500]}" if recent and not previous else ""
+        moves = None  # mentor moves: found with the saves below, or all of one save's
         if only_id:
             row = await asyncio.to_thread(db.get, only_id)
             rows = [tuple(row) + (1.0,)] if row else []
@@ -670,12 +671,15 @@ async def _answer(question, only_id=None, previous=None, rows=None):
         elif rows is None:
             # a short follow-up ("why?", "tell me more") is searched together with the previous question
             query = f"{_last_qa['q']} {question}" if history and len(question) < 60 else question
-            rows = await asyncio.to_thread(memory.search, query, 10 if previous else 6)
+            rows, moves = await asyncio.to_thread(memory.mentor_context, query, 10 if previous else 6,
+                                                  20 if previous else 15)
         if not rows:
             return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me.", None, []
+        if only_id:
+            moves = await asyncio.to_thread(db.moves_of, only_id)
         profile = await asyncio.to_thread(db.get_setting, "profile", "")
-        excerpt = 30000 if only_id else (12000 if previous else 6000)
-        text = await asyncio.to_thread(brain.answer, question, rows, history, excerpt, profile, previous)
+        excerpt = 30000 if only_id else (3000 if moves else (12000 if previous else 6000))
+        text = await asyncio.to_thread(brain.answer, question, rows, history, excerpt, profile, previous, moves)
         _last_qa.update(at=time.time(), q=question, a=text, id=only_id)
         cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 0 < int(n) <= len(rows)})
         sources = []
@@ -1612,6 +1616,9 @@ async def daily_ping(context: ContextTypes.DEFAULT_TYPE):
         n = await asyncio.to_thread(memory.index_missing)
         if n:
             log.info("indexed %s saves that had no search chunks", n)
+        n = await asyncio.to_thread(memory.moves_missing, 20)
+        if n:
+            log.info("made mentor moves for %s saves that had none", n)
     except Exception:
         log.exception("daily database ping failed")
 

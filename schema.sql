@@ -80,3 +80,20 @@ create table if not exists playbooks (
 
 -- One-tap delete with Undo: deleted saves are hidden first, removed for good a day later
 alter table saves add column if not exists deleted_at timestamptz;
+
+-- Mentor moves: each save broken into its actionable moves ("when this happens -> do this -> say this"),
+-- found by matching Arun's situation to each move's situation. moves_at = when its moves were made.
+create table if not exists moves (
+    id        bigserial primary key,
+    save_id   bigint not null references saves(id) on delete cascade,
+    situation text not null,
+    move      text not null,
+    say       text not null default '',
+    why       text not null default '',
+    avoid     text not null default '',
+    embedding vector(768),
+    tsv       tsvector generated always as (to_tsvector('english', situation || ' ' || move || ' ' || say)) stored
+);
+create index if not exists moves_save_idx on moves (save_id);
+create index if not exists moves_tsv_idx on moves using gin (tsv);
+alter table saves add column if not exists moves_at timestamptz;

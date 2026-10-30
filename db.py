@@ -488,3 +488,55 @@ def purge_deleted():
 def delete(save_id):
     with _connect() as c:
         return c.execute("delete from saves where id = %s returning title", (save_id,)).fetchone()
+
+
+# ---------- Mentor moves ----------
+
+def replace_moves(save_id, moves):
+    """moves: list of (situation, move, say, why, avoid, embedding). Replaces the save's old moves in one go."""
+    with _connect() as c:
+        c.execute("delete from moves where save_id = %s", (save_id,))
+        for m in moves:
+            c.execute("insert into moves (save_id, situation, move, say, why, avoid, embedding) "
+                      "values (%s, %s, %s, %s, %s, %s, %s)", (save_id, *m[:5], _vec(m[5])))
+        c.execute("update saves set moves_at = now() where id = %s", (save_id,))
+
+
+def saves_without_moves(limit=10):
+    with _connect() as c:
+        return [r[0] for r in c.execute(
+            "select id from saves where status = 'done' and moves_at is null order by id limit %s", (limit,))]
+
+
+def search_moves(query, embedding, limit=15, per_save=3, pool=120):
+    """The moves whose situation best fits Arun's, at most per_save from one save so one long podcast can't
+    crowd out everything else. Rows: (save_id, situation, move, say, why, avoid, score, title, source_type,
+    created_at, source_url)."""
+    v = _vec(embedding)
+    with _connect() as c:
+        rows = c.execute(
+            """with q as (select to_tsquery('english', replace(plainto_tsquery('english', %s)::text, '&', '|')) as q)
+               select m.save_id, m.situation, m.move, m.say, m.why, m.avoid,
+                      1 - (m.embedding <=> %s) + case when m.tsv @@ q.q then %s else 0 end
+                        + case when s.proven then %s else 0 end as score,
+                      s.title, s.source_type, s.created_at, s.source_url
+               from moves m join saves s on s.id = m.save_id, q
+               where s.status = 'done' order by m.embedding <=> %s limit %s""",
+            (query, v, WORD_BONUS, PROVEN_BONUS, v, pool)).fetchall()
+    rows.sort(key=lambda r: r[6], reverse=True)
+    out, per = [], {}
+    for r in rows:
+        if per.get(r[0], 0) < per_save:
+            per[r[0]] = per.get(r[0], 0) + 1
+            out.append(r)
+    return out[:limit]
+
+
+def moves_of(save_id):
+    """All moves of one save, in the same row shape as search_moves (score 1.0)."""
+    with _connect() as c:
+        return c.execute(
+            """select m.save_id, m.situation, m.move, m.say, m.why, m.avoid, 1.0, s.title, s.source_type,
+                      s.created_at, s.source_url
+               from moves m join saves s on s.id = m.save_id where m.save_id = %s order by m.id""",
+            (save_id,)).fetchall()

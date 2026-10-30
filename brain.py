@@ -423,6 +423,58 @@ def note_text_for_search(note):
     return f"{note.title}\nTopic: {note.topic}\n{note.summary}\n" + "\n".join(note.key_points)
 
 
+class Move(BaseModel):
+    situation: str
+    move: str
+    say: str
+    why: str
+    avoid: str
+
+
+class Moves(BaseModel):
+    moves: list[Move]
+
+
+MOVE_RULES = """You turn one item Arun saved (a video, reel, podcast or post) into MENTOR MOVES: the specific,
+actionable pieces of advice in it, each tied to the real-life moment it is for. Later, when Arun describes his
+situation, the best 1-3 moves are picked from thousands, so every move must make sense on its own.
+For every distinct piece of advice (a technique, script, framework, rule or mindset shift) write:
+- situation: the real-life moment it is for, in plain words, the way the person living it would describe it, e.g.
+  "A client says your price is too high", "You get only 5 minutes to present to a senior leader", "You feel scared
+  to make your first cold call". A specific moment, never just a topic name.
+- move: what to do, concretely: the steps, numbers, framework, in 1-4 sentences. Keep the creator's specifics.
+- say: the exact words to say or write, if the item gives a line (short). Otherwise "".
+- why: why it works, as the creator explains it, in one sentence. Otherwise "".
+- avoid: the mistake it warns about, or when NOT to use it. Otherwise "".
+Rules:
+- Only what this item actually teaches. Add nothing from your own knowledge. Keep claims as the creator's.
+- One idea per move. Don't merge different situations; don't chop one technique into tiny pieces either.
+- Skip intros, filler, self-promotion and anything not actionable (pure news, stories with no lesson). If the item
+  has no actionable advice, return an empty list.
+- Be thorough: capture EVERY distinct technique, script and rule taught. A short reel usually has 1-4 moves;
+  one part of a long podcast or class usually has 5-15.
+- Clear, simple English (translate Tamil/Hindi)."""
+
+
+def extract_moves(title, topic, summary, points, content):
+    """The actionable moves in one save (list of Move). Lite models first: this runs once per save."""
+    text = (f"Title: {title}\nTopic: {topic}\nSummary: {summary}\nKey points:\n- " + "\n- ".join(points or [])
+            + f"\n\nNotes / transcript (this part):\n{(content or '')[:150_000]}")
+    resp = _generate(contents=text, config=types.GenerateContentConfig(
+        system_instruction=MOVE_RULES, response_mime_type="application/json", response_schema=Moves,
+        max_output_tokens=30000), models=SAVE_MODELS)
+    if resp.parsed:
+        return resp.parsed.moves
+    if not resp.text:
+        raise RuntimeError("Gemini returned no moves for this item")
+    return Moves(**json.loads(resp.text)).moves
+
+
+def move_text(m):
+    """One move as the text that gets embedded: matched against Arun's situation."""
+    return f"{m.situation}\n{m.move}" + (f'\nSay: "{m.say}"' if m.say else "")
+
+
 RECAP_RULES = """You write Arun's Sunday recap of what he saved in his second brain this week.
 Goal: help him actually remember and use it. Plain, friendly English, like a friend texting. Plain text only (no markdown, no ** bold **, no tables); use emoji section markers and • bullets.
 Format:
@@ -448,22 +500,44 @@ def weekly_recap(rows, throwback=None):
     return (resp.text or "").strip()
 
 
-ANSWER_RULES = """Arun saves videos and posts from people who are great at things (sales, negotiation, coding,
-content, communication, career, anything). You are his panel of those mentors, standing next to him in a real moment
-of need. Use what THEY taught (the saved notes) to tell him exactly what to do now.
+MENTOR_RULES = """You are Arun's mentor: one person who knows everything he saved from people who are great at
+things (sales, negotiation, communication, career, content, coding, anything), and who knows him and where he wants
+to go. Out of all the moves you are given, CHOOSE the very few that fit his exact situation and tell him what to do.
+Decide; don't summarise the notes or list everything.
 
 How to answer:
-1. First line: the direct answer for his situation. No greeting, no restating the question.
-2. "What your mentors would tell you": the 2-4 most useful moves from the notes, each APPLIED to his situation, with the
-   specific technique, steps, numbers or exact words to say. Name the source naturally (the creator if the note names
-   them, otherwise the video's title) and cite it like [1]. Combine several mentors into one plan when they fit together.
-3. "Your move now": 1-3 concrete next actions or the exact lines to say, in order.
-4. Only if the notes don't fully cover it: a short "My take:" with your own reasoning, never presented as something
-   he saved. If nothing fits at all, say so in one line, then "My take:".
-5. If the notes DISAGREE: start with "Your saves disagree:", give each side in one line with citation, saved date and
-   reason, say which is newer, and let him decide.
-Style: plain, friendly English like a smart friend who has been there. Short (under 220 words). Bullet points for steps.
-Plain text only: no markdown headings, no ** bold **, no tables."""
+1. "Do this:" the single best move, applied to his exact case, with the exact words to say when there are any.
+2. "Backup:" one other move that fits, in case the first doesn't land. Skip it if none truly fits.
+3. "Avoid:" the one mistake to dodge here, from the notes when possible.
+4. "Your next step:" one small, concrete action he can do today. He is building confidence, so make it doable.
+5. Name where each move came from (the creator or the save's title).
+6. If his saves don't cover the situation: say "Your saves don't cover this." in one line, give your best advice as
+   "My take:", and name 1-2 specific, well-known people, books or podcasts known for exactly this, to learn from and
+   save next.
+7. If the moves DISAGREE: "Your saves disagree:", each side in one line with its source and date, which is newer, then
+   your call.
+If he is only asking what a save said (not for advice), just tell him clearly instead."""
+
+ANSWER_RULES = MENTOR_RULES + """
+Cite saves like [1] (the number of the save in the list). Style: plain, friendly English, like a mentor who has been
+there. Under 200 words. Plain text only: no markdown headings, no ** bold **, no tables."""
+
+
+def moves_block(moves, number_of=None):
+    """Candidate moves as text. number_of: save_id -> its [n] in the answer's save list (for citations)."""
+    out = []
+    for k, (sid, situation, move, say, why, avoid, *_rest) in enumerate(moves, 1):
+        title, created = _rest[1], _rest[3]
+        src = f"[{number_of[sid]}] " if number_of and sid in number_of else ""
+        line = f"M{k}. WHEN: {situation}\n    DO: {move}"
+        if say:
+            line += f'\n    SAY: "{say}"'
+        if why:
+            line += f"\n    WHY: {why}"
+        if avoid:
+            line += f"\n    AVOID: {avoid}"
+        out.append(line + f"\n    FROM: {src}{title} (saved {created:%d %b %Y})")
+    return "\n".join(out)
 
 DEEPER = """
 His previous answer to this question was NOT helpful enough:
@@ -474,9 +548,10 @@ Do clearly better: be more specific to his situation, use more of the notes' con
 words to say), fix anything vague or generic, and don't repeat the same advice in the same way."""
 
 
-def answer(question, rows, history="", excerpt=6000, profile="", previous=None):
+def answer(question, rows, history="", excerpt=6000, profile="", previous=None, moves=None):
     """history: the previous question + answer, so follow-ups like 'tell me more' make sense.
-    previous: an answer Arun rated 👎; the retry then thinks longer and must do better."""
+    previous: an answer Arun rated 👎; the retry then thinks longer and must do better.
+    moves: candidate mentor moves (search_moves rows); the notes then only back them up."""
     blocks = []
     for i, r in enumerate(rows, 1):
         _, created, stype, url, title, topic, summary, points, content = r[:9]
@@ -488,6 +563,9 @@ def answer(question, rows, history="", excerpt=6000, profile="", previous=None):
     if profile:  # who Arun is, so advice fits his real situation
         prev = f"\n\nAbout Arun (use this to tailor the advice):\n{profile}" + prev
     rules = ANSWER_RULES + (DEEPER.format(previous=previous[:3000]) if previous else "")
+    if moves:
+        number_of = {r[0]: i for i, r in enumerate(rows, 1)}
+        prev = "\n\nCandidate mentor moves (best fit first; choose from these):\n" + moves_block(moves, number_of) + prev
     resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + prev + f"\n\nArun's question: {question}",
         config=types.GenerateContentConfig(system_instruction=rules, thinking_config=types.ThinkingConfig(
             thinking_budget=8192 if previous else 2048)),
