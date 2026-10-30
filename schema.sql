@@ -97,3 +97,28 @@ create table if not exists moves (
 create index if not exists moves_save_idx on moves (save_id);
 create index if not exists moves_tsv_idx on moves using gin (tsv);
 alter table saves add column if not exists moves_at timestamptz;
+
+-- Journey: the real situations Arun asked about, what the mentor advised, and how it went (asked the next day)
+create table if not exists journal (
+    id          bigserial primary key,
+    at          timestamptz not null default now(),
+    situation   text not null,
+    advice      text not null default '',
+    save_ids    bigint[] not null default '{}',
+    embedding   vector(768),
+    followup_at timestamptz,
+    followup_msg bigint,
+    result      smallint,           -- 1 worked, 0 mixed, -1 didn't, null = not told yet
+    outcome     text not null default ''
+);
+
+-- Daily review: when each move comes back (spaced repetition, Leitner boxes 1-5)
+create table if not exists move_reviews (
+    move_id  bigint primary key references moves(id) on delete cascade,
+    box      int not null default 1,
+    due      date not null,
+    last_at  date not null
+);
+
+-- Named mentors: the creator of each save, e.g. "Alex Hormozi"
+alter table saves add column if not exists creator text not null default '';

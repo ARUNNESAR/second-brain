@@ -508,21 +508,25 @@ def saves_without_moves(limit=10):
             "select id from saves where status = 'done' and moves_at is null order by id limit %s", (limit,))]
 
 
-def search_moves(query, embedding, limit=15, per_save=3, pool=120):
+MOVE_COLS = """m.save_id, m.situation, m.move, m.say, m.why, m.avoid, {score}, s.title, s.source_type, s.created_at,
+               s.source_url, m.id, s.creator"""
+
+
+def search_moves(query, embedding, limit=15, per_save=3, pool=120, creator=""):
     """The moves whose situation best fits Arun's, at most per_save from one save so one long podcast can't
-    crowd out everything else. Rows: (save_id, situation, move, say, why, avoid, score, title, source_type,
-    created_at, source_url)."""
+    crowd out everything else. creator: only moves from that mentor's saves. Rows: (save_id, situation, move, say,
+    why, avoid, score, title, source_type, created_at, source_url, move_id, creator)."""
     v = _vec(embedding)
+    score = """1 - (m.embedding <=> %s) + case when m.tsv @@ q.q then %s else 0 end
+               + case when s.proven then %s else 0 end"""
     with _connect() as c:
         rows = c.execute(
-            """with q as (select to_tsquery('english', replace(plainto_tsquery('english', %s)::text, '&', '|')) as q)
-               select m.save_id, m.situation, m.move, m.say, m.why, m.avoid,
-                      1 - (m.embedding <=> %s) + case when m.tsv @@ q.q then %s else 0 end
-                        + case when s.proven then %s else 0 end as score,
-                      s.title, s.source_type, s.created_at, s.source_url
+            f"""with q as (select to_tsquery('english', replace(plainto_tsquery('english', %s)::text, '&', '|')) as q)
+               select {MOVE_COLS.format(score=score)}
                from moves m join saves s on s.id = m.save_id, q
-               where s.status = 'done' order by m.embedding <=> %s limit %s""",
-            (query, v, WORD_BONUS, PROVEN_BONUS, v, pool)).fetchall()
+               where s.status = 'done' and (%s = '' or s.creator ilike %s)
+               order by m.embedding <=> %s limit %s""",
+            (query, v, WORD_BONUS, PROVEN_BONUS, creator, f"%{_like(creator)}%", v, pool)).fetchall()
     rows.sort(key=lambda r: r[6], reverse=True)
     out, per = [], {}
     for r in rows:
@@ -535,8 +539,157 @@ def search_moves(query, embedding, limit=15, per_save=3, pool=120):
 def moves_of(save_id):
     """All moves of one save, in the same row shape as search_moves (score 1.0)."""
     with _connect() as c:
+        return c.execute(f"""select {MOVE_COLS.format(score="1.0")} from moves m join saves s on s.id = m.save_id
+                             where m.save_id = %s order by m.id""", (save_id,)).fetchall()
+
+
+def move(move_id):
+    with _connect() as c:
+        return c.execute(f"""select {MOVE_COLS.format(score="1.0")} from moves m join saves s on s.id = m.save_id
+                             where m.id = %s""", (move_id,)).fetchone()
+
+
+# ---------- Named mentors ----------
+
+def set_creator(save_id, name, only_if_empty=False):
+    with _connect() as c:
+        c.execute("update saves set creator = %s where id = %s" + (" and creator in ('', '-')" if only_if_empty else ""),
+                  ((name or "").strip()[:80], save_id))
+
+
+def creators(limit=40):
+    """The mentors Arun learns from: (name, how many saves), most saved first."""
+    with _connect() as c:
+        return c.execute("""select creator, count(*) from saves where status = 'done' and creator not in ('', '-')
+                            group by creator order by count(*) desc, creator limit %s""", (limit,)).fetchall()
+
+
+def saves_without_creator(limit=200):
+    with _connect() as c:
+        return c.execute("""select id, title, left(coalesce(summary, ''), 300), source_url, left(coalesce(content, ''), 600)
+                            from saves where status = 'done' and creator = '' order by id limit %s""",
+                         (limit,)).fetchall()
+
+
+# ---------- Journey: real situations and how they went ----------
+
+def add_journal(situation, advice, save_ids, embedding, followup_at):
+    with _connect() as c:
+        return c.execute("""insert into journal (situation, advice, save_ids, embedding, followup_at)
+                            values (%s, %s, %s, %s, %s) returning id""",
+                         (situation, advice, list(save_ids), _vec(embedding), followup_at)).fetchone()[0]
+
+
+def due_followups(limit=2):
+    with _connect() as c:
+        return c.execute("""select id, at, situation from journal where result is null and followup_at <= now()
+                            order by at limit %s""", (limit,)).fetchall()
+
+
+def set_followup(journal_id, msg_id, next_at=None):
+    """Mark the follow-up as sent (msg_id); next_at = ask again then (None = don't ask again)."""
+    with _connect() as c:
+        c.execute("update journal set followup_msg = %s, followup_at = %s where id = %s", (msg_id, next_at, journal_id))
+
+
+def set_result(journal_id, result):
+    with _connect() as c:
+        r = c.execute("update journal set result = %s, followup_at = null where id = %s returning save_ids",
+                      (result, journal_id)).fetchone()
+        return r[0] if r else []
+
+
+def add_outcome(journal_id, text):
+    with _connect() as c:
+        c.execute("update journal set outcome = trim(outcome || ' ' || %s) where id = %s", (text[:1000], journal_id))
+
+
+def journal_by_msg(msg_id):
+    with _connect() as c:
+        r = c.execute("select id from journal where followup_msg = %s", (msg_id,)).fetchone()
+        return r[0] if r else None
+
+
+def similar_journal(embedding, limit=3, min_score=0.72):
+    """His past situations most like this one, with what happened: (at, situation, advice, result, outcome)."""
+    v = _vec(embedding)
+    with _connect() as c:
+        return [r[:5] for r in c.execute(
+            """select at, situation, advice, result, outcome, 1 - (embedding <=> %s) as s from journal
+               where embedding is not null order by embedding <=> %s limit %s""", (v, v, limit))
+                if r[5] >= min_score]
+
+
+def journal_since(days=7):
+    with _connect() as c:
+        return c.execute("""select at, situation, result, outcome from journal
+                            where at >= now() - make_interval(days => %s) order by at""", (days,)).fetchall()
+
+
+# ---------- Daily review (spaced repetition of moves) ----------
+
+REVIEW_DAYS = [1, 3, 7, 21, 60]  # box 1..5: days until the move comes back
+
+
+def next_review_move(goal_embedding=None, save_id=None, after_move=None):
+    """The next move to review. Daily: a move that is due, else a new one closest to his goal; none twice a day.
+    save_id: quiz on one save, in order after after_move."""
+    with _connect() as c:
+        if save_id:
+            r = c.execute(f"""select {MOVE_COLS.format(score="1.0")} from moves m join saves s on s.id = m.save_id
+                              where m.save_id = %s and m.id > %s order by m.id limit 1""",
+                          (save_id, after_move or 0)).fetchone()
+            return r
+        r = c.execute(f"""select {MOVE_COLS.format(score="1.0")} from moves m join saves s on s.id = m.save_id
+                          join move_reviews v on v.move_id = m.id
+                          where s.status = 'done' and v.due <= current_date and v.last_at < current_date
+                          order by v.due, m.id limit 1""").fetchone()
+        if r or goal_embedding is None:
+            return r
+        v = _vec(goal_embedding)
+        return c.execute(f"""select {MOVE_COLS.format(score="1.0")} from moves m join saves s on s.id = m.save_id
+                             where s.status = 'done' and not exists (select 1 from move_reviews r where r.move_id = m.id)
+                               and m.save_id not in (select m2.save_id from move_reviews r2 join moves m2 on m2.id = r2.move_id
+                                                     where r2.last_at = current_date)  -- one card per save a day
+                             order by m.embedding <=> %s limit 1""", (v,)).fetchone()
+
+
+def review_mark(move_id, knew_it):
+    """Knew it: the move comes back later each time (1, 3, 7, 21, 60 days). Not yet: back to tomorrow."""
+    with _connect() as c:
+        r = c.execute("select box from move_reviews where move_id = %s", (move_id,)).fetchone()
+        box = min((r[0] if r else 0) + 1, len(REVIEW_DAYS)) if knew_it else 1
+        c.execute("""insert into move_reviews (move_id, box, due, last_at)
+                     values (%s, %s, current_date + %s, current_date)
+                     on conflict (move_id) do update set box = excluded.box, due = excluded.due,
+                                                         last_at = excluded.last_at""",
+                  (move_id, box, REVIEW_DAYS[box - 1]))
+
+
+def reviewed_today():
+    with _connect() as c:
+        return c.execute("select count(*) from move_reviews where last_at = current_date").fetchone()[0]
+
+
+def search_moves_multi(queries, embeddings, pool=40, creator=""):
+    """search_moves for several wordings of one question in ONE database round trip (each round trip to the
+    database costs ~0.3-1 s). Each move keeps its best score over the wordings; the extra last column 'direct' is
+    its score for the first wording (his own words), used to tell real matches from off-topic questions."""
+    vecs = [str(list(e)) for e in embeddings]
+    with _connect() as c:
         return c.execute(
-            """select m.save_id, m.situation, m.move, m.say, m.why, m.avoid, 1.0, s.title, s.source_type,
-                      s.created_at, s.source_url
-               from moves m join saves s on s.id = m.save_id where m.save_id = %s order by m.id""",
-            (save_id,)).fetchall()
+            f"""with qs as (select k, qt, v::vector as v
+                            from unnest(%s::int[], %s::text[], %s::text[]) as t(k, qt, v)),
+                     scored as (
+                        select m.id as mid, qs.k, 1 - (m.embedding <=> qs.v)
+                               + case when m.tsv @@ to_tsquery('english', replace(
+                                   plainto_tsquery('english', qs.qt)::text, '&', '|')) then %s else 0 end as sc
+                        from moves m cross join qs),
+                     best as (select mid, max(sc) as sc, max(sc) filter (where k = 0) as direct
+                              from scored group by mid)
+                select {MOVE_COLS.format(score="best.sc + case when s.proven then %s else 0 end")}, best.direct
+                from best join moves m on m.id = best.mid join saves s on s.id = m.save_id
+                where s.status = 'done' and (%s = '' or s.creator ilike %s)
+                order by best.sc desc limit %s""",
+            (list(range(len(queries))), list(queries), vecs, WORD_BONUS, PROVEN_BONUS,
+             creator, f"%{_like(creator)}%", pool)).fetchall()

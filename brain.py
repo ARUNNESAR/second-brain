@@ -387,7 +387,7 @@ def _pace(n):
         time.sleep(61 - (now - _embed_log[0][0]))
 
 
-def embed_many(texts, batch=40):
+def embed_many(texts, batch=40, for_query=False):
     """Embeddings for many texts in few requests, paced to the free per-minute limit (retries if it's hit anyway)."""
     out = []
     for i in range(0, len(texts), batch):
@@ -397,7 +397,8 @@ def embed_many(texts, batch=40):
             try:
                 r = client().models.embed_content(
                     model=EMBED_MODEL, contents=part,
-                    config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM, task_type="RETRIEVAL_DOCUMENT"))
+                    config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM,
+                                                    task_type="RETRIEVAL_QUERY" if for_query else "RETRIEVAL_DOCUMENT"))
                 break
             except Exception as e:
                 if "429" not in str(e) or attempt == 3:
@@ -432,12 +433,14 @@ class Move(BaseModel):
 
 
 class Moves(BaseModel):
+    creator: str  # the person teaching (e.g. "Alex Hormozi"), "" if unknown
     moves: list[Move]
 
 
 MOVE_RULES = """You turn one item Arun saved (a video, reel, podcast or post) into MENTOR MOVES: the specific,
 actionable pieces of advice in it, each tied to the real-life moment it is for. Later, when Arun describes his
 situation, the best 1-3 moves are picked from thousands, so every move must make sense on its own.
+creator: the name of the person teaching (the creator or guest), only if the item shows or says it; else "".
 For every distinct piece of advice (a technique, script, framework, rule or mindset shift) write:
 - situation: the real-life moment it is for, in plain words, the way the person living it would describe it, e.g.
   "A client says your price is too high", "You get only 5 minutes to present to a senior leader", "You feel scared
@@ -457,22 +460,95 @@ Rules:
 
 
 def extract_moves(title, topic, summary, points, content):
-    """The actionable moves in one save (list of Move). Lite models first: this runs once per save."""
+    """The actionable moves in one save (a Moves: creator + list of Move). Lite models first: runs once per save."""
     text = (f"Title: {title}\nTopic: {topic}\nSummary: {summary}\nKey points:\n- " + "\n- ".join(points or [])
             + f"\n\nNotes / transcript (this part):\n{(content or '')[:150_000]}")
     resp = _generate(contents=text, config=types.GenerateContentConfig(
         system_instruction=MOVE_RULES, response_mime_type="application/json", response_schema=Moves,
         max_output_tokens=30000), models=SAVE_MODELS)
     if resp.parsed:
-        return resp.parsed.moves
+        return resp.parsed
     if not resp.text:
         raise RuntimeError("Gemini returned no moves for this item")
-    return Moves(**json.loads(resp.text)).moves
+    return Moves(**json.loads(resp.text))
 
 
 def move_text(m):
     """One move as the text that gets embedded: matched against Arun's situation."""
     return f"{m.situation}\n{m.move}" + (f'\nSay: "{m.say}"' if m.say else "")
+
+
+class Creators(BaseModel):
+    names: list[str]  # one per item, same order; "" if the item doesn't show who is teaching
+
+
+def creators_for(items):
+    """Who teaches in each saved item (title, summary, link, start of content), for older saves made before
+    moves knew their creator. One Lite call for up to ~25 items."""
+    text = "\n\n".join(f"Item {k}:\nTitle: {t}\nSummary: {s}\nLink: {u or '-'}\nStart: {c}"
+                       for k, (_, t, s, u, c) in enumerate(items, 1))
+    resp = _generate(contents=text, config=types.GenerateContentConfig(
+        system_instruction=("For each item, give the name of the person teaching it (the creator, speaker or guest), "
+                            "e.g. \"Alex Hormozi\". Use the full name when known. Only when the item itself shows or says "
+                            "it; never guess. Otherwise \"\". Same order as the items, one name per item."),
+        response_mime_type="application/json", response_schema=Creators), models=SAVE_MODELS)
+    names = (resp.parsed or Creators(**json.loads(resp.text or '{"names": []}'))).names
+    return (names + [""] * len(items))[:len(items)]
+
+
+# ---------- Understanding his message before searching (query rewriting) ----------
+
+class QueryPlan(BaseModel):
+    situations: list[str]  # 3 ways to describe his situation, as the moment the advice is for
+    real_situation: bool   # true if he is facing (or about to face) a real situation, not asking a fact or a summary
+    summary: str           # his situation in under 15 words, e.g. "School principal said too costly, will think"
+    mentor: str            # a mentor he names ("what would Hormozi say"), exactly as in the list; else ""
+
+
+def plan_query(question, mentors=()):
+    """Turn his message (any wording, Tanglish too) into clear situations to search with, and notice whether it's a
+    real moment in his life (worth a follow-up) and whether he wants one named mentor."""
+    resp = _generate(
+        contents=f"Mentors in his saves: {', '.join(mentors) or 'none'}\n\nHis message: {question}",
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "Rewrite his message for searching a library of advice. situations: 3 different short descriptions "
+                "(under 20 words, in English) of the moment he is in, written the way a coach would label it, e.g. "
+                "\"A client says your price is too high and wants to think about it\". Stay on HIS topic: never "
+                "change what he is asking about; if it is a plain question (not a life situation), the 3 lines just "
+                "restate it in different words. real_situation: true only if he describes something happening in his "
+                "own life or work. summary: his situation in under 15 words. mentor: if he asks what a specific "
+                "person would say or wants advice from one person, that person's name from the list; else \"\"."),
+            response_mime_type="application/json", response_schema=QueryPlan),
+        models=SAVE_MODELS)
+    p = resp.parsed or QueryPlan(**json.loads(resp.text))
+    p.situations = [s for s in p.situations if s.strip()][:3]
+    return p
+
+
+class Ranked(BaseModel):
+    best: list[int]  # move numbers, most helpful first
+
+
+def rerank(question, profile, moves, keep=12):
+    """A second look: of the candidate moves (found because they SOUND similar), which would actually help him right
+    now? Returns the moves reordered, most useful first. Falls back to the given order if it fails."""
+    listing = "\n".join(f"{k}. WHEN: {m[1]} | DO: {m[2][:200]}" for k, m in enumerate(moves, 1))
+    try:
+        resp = _generate(
+            contents=f"About Arun: {profile or 'unknown'}\n\nHis message: {question}\n\nCandidate moves:\n{listing}",
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    f"Pick up to {keep} moves that would genuinely help him in THIS situation, most helpful first. "
+                    "Judge by usefulness for his exact case, not by shared words. Leave out moves for a different "
+                    "situation. Reply with their numbers."),
+                response_mime_type="application/json", response_schema=Ranked),
+            models=SAVE_MODELS)
+        best = (resp.parsed or Ranked(**json.loads(resp.text))).best
+        picked = [moves[k - 1] for k in dict.fromkeys(best) if 0 < k <= len(moves)]
+        return picked or moves[:keep]
+    except Exception:
+        return moves[:keep]
 
 
 RECAP_RULES = """You write Arun's Sunday recap of what he saved in his second brain this week.
@@ -483,10 +559,15 @@ Format:
 💡 Top 3 lessons: the three most useful, specific points from the whole week (keep numbers / exact steps)
 ✅ Try this week: 3 small, concrete actions he can do, based on the saves
 {throwback_rule}
-Keep it under 250 words. No intro or sign-off."""
+{journey_rule}
+Keep it under 280 words. No intro or sign-off."""
+
+JOURNEY_RULE = ("🧭 Your journey: 2-3 lines on the real situations he faced this week (listed below): what worked, "
+                "what didn't, and ONE pattern you notice (e.g. he keeps delaying calls, or one move keeps working). "
+                "Honest and kind, like a mentor.")
 
 
-def weekly_recap(rows, throwback=None):
+def weekly_recap(rows, throwback=None, journal=None):
     def fmt(r):
         _, created, stype, _, title, topic, summary, points = r
         return f"- {title} ({topic}, {stype}, {created:%a}): {summary} Points: " + "; ".join(points or [])
@@ -495,8 +576,13 @@ def weekly_recap(rows, throwback=None):
     text = "This week's saves:\n" + "\n".join(fmt(r) for r in rows)
     if throwback:
         text += f"\n\nOlder save to bring back (saved {throwback[1]:%d %b}):\n" + fmt(throwback)
+    if journal:
+        mark = {1: "worked", 0: "mixed", -1: "didn't work", None: "not told"}
+        text += "\n\nReal situations he faced this week:\n" + "\n".join(
+            f"- {at:%a}: {sit} → {mark.get(res, 'not told')}" + (f" ({out[:150]})" if out else "")
+            for at, sit, res, out in journal)
     resp = _generate(contents=text, config=types.GenerateContentConfig(
-        system_instruction=RECAP_RULES.format(throwback_rule=rule)))
+        system_instruction=RECAP_RULES.format(throwback_rule=rule, journey_rule=JOURNEY_RULE if journal else "")))
     return (resp.text or "").strip()
 
 
@@ -510,13 +596,25 @@ How to answer:
 2. "Backup:" one other move that fits, in case the first doesn't land. Skip it if none truly fits.
 3. "Avoid:" the one mistake to dodge here, from the notes when possible.
 4. "Your next step:" one small, concrete action he can do today. He is building confidence, so make it doable.
-5. Name where each move came from (the creator or the save's title).
+5. Name where each move came from: the mentor's name when known (e.g. "Hormozi's move"), else the save's title.
 6. If his saves don't cover the situation: say "Your saves don't cover this." in one line, give your best advice as
-   "My take:", and name 1-2 specific, well-known people, books or podcasts known for exactly this, to learn from and
-   save next.
+   "My take:", and name 1-2 specific people, books or podcasts known for exactly this, to learn from and save next.
+   Prefer mentors he already follows (listed below) when one of them is known for it.
 7. If the moves DISAGREE: "Your saves disagree:", each side in one line with its source and date, which is newer, then
    your call.
+8. If his past shows a similar situation (listed below), build on it in one line: repeat what worked, change what
+   didn't.
+9. For a big life decision (changing career, quitting, money, pricing his own work), if you don't know what matters
+   most to him, ask him ONE short question first instead of answering.
+If he asks what one named mentor would say, answer as that mentor from their moves only; if none are theirs, say so.
 If he is only asking what a save said (not for advice), just tell him clearly instead."""
+
+
+def past_block(past):
+    """His past similar situations and how they went, for rule 8."""
+    mark = {1: "✅ worked", 0: "😐 mixed", -1: "❌ didn't work", None: "outcome unknown"}
+    return "\n".join(f"- {at:%d %b}: {sit} → advised: {adv[:200]} → {mark.get(res, 'outcome unknown')}"
+                     + (f" ({out[:200]})" if out else "") for at, sit, adv, res, out in past)
 
 ANSWER_RULES = MENTOR_RULES + """
 Cite saves like [1] (the number of the save in the list). Style: plain, friendly English, like a mentor who has been
@@ -528,7 +626,10 @@ def moves_block(moves, number_of=None):
     out = []
     for k, (sid, situation, move, say, why, avoid, *_rest) in enumerate(moves, 1):
         title, created = _rest[1], _rest[3]
+        creator = _rest[6] if len(_rest) > 6 else ""
         src = f"[{number_of[sid]}] " if number_of and sid in number_of else ""
+        if creator:
+            src += f"{creator}: "
         line = f"M{k}. WHEN: {situation}\n    DO: {move}"
         if say:
             line += f'\n    SAY: "{say}"'
@@ -548,7 +649,7 @@ Do clearly better: be more specific to his situation, use more of the notes' con
 words to say), fix anything vague or generic, and don't repeat the same advice in the same way."""
 
 
-def answer(question, rows, history="", excerpt=6000, profile="", previous=None, moves=None):
+def answer(question, rows, history="", excerpt=6000, profile="", previous=None, moves=None, past=None, mentors=None):
     """history: the previous question + answer, so follow-ups like 'tell me more' make sense.
     previous: an answer Arun rated 👎; the retry then thinks longer and must do better.
     moves: candidate mentor moves (search_moves rows); the notes then only back them up."""
@@ -566,6 +667,10 @@ def answer(question, rows, history="", excerpt=6000, profile="", previous=None, 
     if moves:
         number_of = {r[0]: i for i, r in enumerate(rows, 1)}
         prev = "\n\nCandidate mentor moves (best fit first; choose from these):\n" + moves_block(moves, number_of) + prev
+    if past:
+        prev += "\n\nHis past similar situations and how they went:\n" + past_block(past)
+    if mentors:
+        prev += "\n\nMentors he already follows: " + ", ".join(mentors)
     resp = _generate(contents=f"Saved notes:\n\n" + "\n\n".join(blocks) + prev + f"\n\nArun's question: {question}",
         config=types.GenerateContentConfig(system_instruction=rules, thinking_config=types.ThinkingConfig(
             thinking_budget=8192 if previous else 2048)),
@@ -590,7 +695,9 @@ def clarify_check(question, profile, titles):
                 "Decide if ONE short clarifying question is needed before giving him advice. Ask only when the right "
                 "advice would be clearly different depending on a missing detail (who the other person is, the goal, "
                 "the stage, the constraint). Do NOT ask if the message is already specific, is a simple factual or "
-                "how-to question, or asks for a list/summary. Most messages need no question."),
+                "how-to question, or asks for a list/summary. Most messages need no question. ALSO ask, like a good "
+                "coach, when it is a big life decision (changing career, quitting, money, pricing his own work) and "
+                "you don't know what matters most to him: then ask what matters most (e.g. income now vs. growth)."),
             response_mime_type="application/json", response_schema=Clarify),
         models=SAVE_MODELS)
     c = resp.parsed if resp.parsed else Clarify(**json.loads(resp.text or '{"ask": false, "question": "", "options": []}'))
@@ -618,6 +725,8 @@ ACTIONS = {
     "recap": "a recap/summary of the last week",
     "practice": "rehearse / role-play / practice a conversation or situation (text = the situation)",
     "playbook": "make/show/update a playbook or guide for a topic (text = the topic)",
+    "review": "start the daily review / quiz me / test me on what I saved",
+    "mentors": "show the mentors/creators he learns from (\"who are my mentors\"); NOT asking what one would say",
     "worked": "a tip/save WORKED for him in real life (target = which one)",
     "screen_text": "get the text/prompt shown on screen in a saved video (target = which one)",
     "resource": "get the resource/link a creator offers (comment-for-link) (target = which one)",
@@ -666,7 +775,8 @@ His saved mentors' advice for this situation:
 DEBRIEF_RULES = """The practice session below is over. Give Arun a short debrief, talking to him as "you". Judge ONLY the lines
 marked ARUN; never claim he did something he didn't say. If he only said a line or two, say the session was short and
 focus on how to continue:
-- Score: X/10 and one line why.
+- Scorecard, each /10 with a few words why: Opening, Listening & questions, Handling pushback, Using your mentors'
+  moves, Next step / close. Then "Overall: X/10". Skip a line he never got to.
 - What you did well (1-2 bullets).
 - Fix next time (2-3 bullets), each with the better line to say, based on his mentors' advice [cite].
 - Your best lines to use for real (2-3 exact sentences).
@@ -822,10 +932,13 @@ def speak(text, voice=None, style=VOICE_STYLE):
     enc.set_quality(2)
     return bytes(enc.encode(pcm) + enc.flush()), "mp3"
 
-def transcribe(audio_bytes, mime):
-    """What Arun said in a voice note (to answer it as a question)."""
-    resp = _generate(contents=[types.Part.from_bytes(data=audio_bytes, mime_type=mime),
-                               "Write down exactly what is said in this voice note, in English (translate Tamil/Hindi). "
-                               "Reply with the words only."],
+def transcribe(audio_bytes, mime, verbatim=False):
+    """What Arun said in a voice note (to answer it as a question). verbatim: keep every filler word, for practice
+    feedback on how he speaks."""
+    rule = ("Write down word for word what is said in this voice note, keeping every filler word (um, uh, like, "
+            "basically, actually, you know, so) and repeat, in English (translate Tamil/Hindi). Reply with the words "
+            "only.") if verbatim else ("Write down exactly what is said in this voice note, in English (translate "
+                                       "Tamil/Hindi). Reply with the words only.")
+    resp = _generate(contents=[types.Part.from_bytes(data=audio_bytes, mime_type=mime), rule],
                      config=types.GenerateContentConfig(), models=SAVE_MODELS)
     return (resp.text or "").strip()

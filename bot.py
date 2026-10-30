@@ -48,11 +48,17 @@ HELP = """🧠 What I can do (just talk to me, no commands)
 Share a reel, video or post, or send a screenshot, voice note or PDF. 👀 = reading, 👌 = saved.
 
 💬 Help you in the moment
-Tell me your situation, e.g. "a client says we're too expensive". I answer from what you saved.
+Tell me your situation, e.g. "a client says we're too expensive". I pick the best moves from what you saved
+and tell you what to do. The next evening I'll ask how it went, so I learn what works for you.
 Not helpful? Tap 👎 and I'll try again.
+"what would Hormozi say about…": advice from one mentor. "who are my mentors": everyone you learn from.
+
+🧠 Daily review
+Every morning: 3 moves to remember, 2 minutes. On any save: ⋯ More → 🧠 Quiz me.
 
 🎭 Practice
-"practice asking for a raise": I play the other person and coach you, then give you a score.
+"practice asking for a raise": I play the other person and coach you, then score you. Answer by voice and I'll
+also tell you your pace and filler words.
 
 📘 Playbooks
 "make my sales playbook": everything you saved on a topic, turned into one clear guide.
@@ -111,6 +117,7 @@ def _details_button(save_id, more=False, kind=None):
         return InlineKeyboardMarkup(rows)
     rows.append([InlineKeyboardButton("✅ It worked for me", callback_data=f"wk:{save_id}"),
                  InlineKeyboardButton("❓ Ask about it", callback_data=f"aq:{save_id}")])
+    rows.append([InlineKeyboardButton("🧠 Quiz me on it", callback_data=f"rv:go:0:{save_id}")])
     if kind in VIDEO_KINDS:
         rows.append([InlineKeyboardButton("📝 Screen text", callback_data=f"st:{save_id}"),
                      InlineKeyboardButton("🎁 Get resource", callback_data=f"rs:{save_id}")])
@@ -266,6 +273,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip()
     urls = list(dict.fromkeys(URL_RE.findall(text)))
     replied = msg.reply_to_message
+    if replied and replied.from_user and replied.from_user.is_bot:  # telling how a past situation went
+        jid = await asyncio.to_thread(db.journal_by_msg, replied.message_id)
+        if jid:
+            await asyncio.to_thread(db.add_outcome, jid, text)
+            await msg.reply_text("📝 Thanks, noted. I'll remember this next time something similar comes up.")
+            return
     if replied and replied.message_id in _clarify:  # answering the bot's quick question in his own words
         pending = _clarify.pop(replied.message_id)
         await respond(msg, pending["q"] + f"\n(More detail from Arun: {text})", ask_first=False)
@@ -291,6 +304,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if "ask" in _awaiting and not urls:  # he tapped "❓ Ask about it": this is the question
         await respond(msg, text, only_id=_awaiting.pop("ask"))
+        return
+    if "mentor" in _awaiting and not urls:  # he tapped "💬 <mentor>": this is what he wants to ask them
+        await respond(msg, f"What would {_awaiting.pop('mentor')} tell me? {text}")
         return
     if _awaiting.pop("practice", None) and not urls:  # he tapped "Practice a conversation": this is the situation
         await start_practice(msg, text)
@@ -405,10 +421,20 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     f = msg.voice or msg.audio
     if msg.voice and _practice.get("active") and (f.file_size or 0) <= MAX_TG_FILE:  # practice: his spoken line
         data = bytes(await (await f.get_file()).download_as_bytearray())
-        said = await asyncio.to_thread(brain.transcribe, data, f.mime_type or "audio/ogg")
+        said = await asyncio.to_thread(brain.transcribe, data, f.mime_type or "audio/ogg", True)
+        _practice.setdefault("voice", []).append((said, msg.voice.duration or 0))  # for feedback on HOW he speaks
         await msg.reply_text(f"🎙 {said}")
         await practice_reply(msg, said, by_voice=True)
         return
+    replied = msg.reply_to_message
+    if msg.voice and replied and replied.from_user and replied.from_user.is_bot:  # telling how a situation went
+        jid = await asyncio.to_thread(db.journal_by_msg, replied.message_id)
+        if jid:
+            data = bytes(await (await f.get_file()).download_as_bytearray())
+            said = await asyncio.to_thread(brain.transcribe, data, f.mime_type or "audio/ogg")
+            await asyncio.to_thread(db.add_outcome, jid, said)
+            await msg.reply_text(f"📝 Noted: “{_short(said, 300)}”\nI'll remember this next time.")
+            return
     if msg.voice and not msg.forward_origin:  # his own voice note: could be an idea to save OR a question
         _voices[msg.message_id] = (f, f.mime_type or "audio/ogg")
         await msg.reply_text("🎙 Ask this as a question, or save it?", reply_markup=InlineKeyboardMarkup([[
@@ -661,26 +687,32 @@ async def _answer(question, only_id=None, previous=None, rows=None):
         if recent and not only_id and not previous and _last_qa["id"] and len(question) <= 40 and FOLLOW_UP_RE.search(question):
             only_id = _last_qa["id"]  # short follow-up after asking about one save: stay on that save
         history = f"Q: {_last_qa['q']}\nA: {_last_qa['a'][:1500]}" if recent and not previous else ""
-        moves = None  # mentor moves: found with the saves below, or all of one save's
+        profile = await asyncio.to_thread(db.get_setting, "profile", "")
+        moves, ctx = None, {}  # mentor moves: found with the saves below, or all of one save's
         if only_id:
             row = await asyncio.to_thread(db.get, only_id)
             rows = [tuple(row) + (1.0,)] if row else []
             if not rows:
                 _last_qa["id"] = None
                 return "That save was deleted, so I can't answer from it.", None, []
-        elif rows is None:
+            moves = await asyncio.to_thread(db.moves_of, only_id)
+        else:
             # a short follow-up ("why?", "tell me more") is searched together with the previous question
             query = f"{_last_qa['q']} {question}" if history and len(question) < 60 else question
-            rows, moves = await asyncio.to_thread(memory.mentor_context, query, 10 if previous else 6,
-                                                  20 if previous else 15)
+            rows, moves, ctx = await asyncio.to_thread(memory.mentor_context, query, 10 if previous else 6,
+                                                       20 if previous else 15, profile)
         if not rows:
             return "Nothing saved yet. Share a YouTube video or a screenshot first, then ask me.", None, []
-        if only_id:
-            moves = await asyncio.to_thread(db.moves_of, only_id)
-        profile = await asyncio.to_thread(db.get_setting, "profile", "")
+        covered = ctx.get("direct", 1) >= memory.MOVE_FLOOR
         excerpt = 30000 if only_id else (3000 if moves else (12000 if previous else 6000))
-        text = await asyncio.to_thread(brain.answer, question, rows, history, excerpt, profile, previous, moves)
+        text = await asyncio.to_thread(brain.answer, question, rows, history, excerpt, profile, previous,
+                                       moves if covered else None, ctx.get("past"), ctx.get("mentors"))
         _last_qa.update(at=time.time(), q=question, a=text, id=only_id)
+        plan = ctx.get("plan")
+        if plan and plan.real_situation and covered and not previous and not history:  # a real moment: ask later how it went
+            cited_ids = [rows[int(n) - 1][0] for n in set(re.findall(r"\[(\d+)\]", text)) if 0 < int(n) <= len(rows)]
+            await asyncio.to_thread(db.add_journal, plan.summary or question[:200], text[:600], cited_ids,
+                                    ctx["vector"], _followup_time())
         cited = sorted({int(n) for n in re.findall(r"\[(\d+)\]", text) if 0 < int(n) <= len(rows)})
         sources = []
         for n in cited:
@@ -1304,6 +1336,10 @@ async def handle_words(msg, context, text, reply_save=None, by_voice=False):
                               "auto": "🎙 I'll reply by voice when you ask by voice."}[mode])
     elif a == "playbook":
         await make_playbook(msg, payload)
+    elif a == "review":
+        await send_review_card(msg.get_bot(), "d")
+    elif a == "mentors":
+        await show_mentors(msg)
     elif a == "backup":
         await cmd_backup(u, c)
     elif a == "export":
@@ -1330,9 +1366,9 @@ async def start_practice(msg, situation):
         return
     status = await msg.reply_text("🎭 Setting up your practice…")
     try:
-        rows = await asyncio.to_thread(memory.search, situation, 6)
-        notes = brain.notes_for(rows)
         profile = await asyncio.to_thread(db.get_setting, "profile", "")
+        rows, moves, _ = await asyncio.to_thread(memory.mentor_context, situation, 6, 10, profile)
+        notes = brain.moves_block(moves) if moves else brain.notes_for(rows)  # the coach judges by these moves
         _practice.clear()
         _practice.update(active=True, situation=situation, notes=notes, history=[], at=time.time(), profile=profile)
         first = await asyncio.to_thread(brain.practice_turn, situation, notes, [], profile)
@@ -1375,6 +1411,7 @@ async def end_practice(msg):
     try:
         out = await asyncio.to_thread(brain.practice_debrief, _practice["situation"], _practice["notes"],
                                       _practice["history"])
+        out += _voice_feedback(_practice.get("voice", []))
         _last_practice["situation"] = _practice["situation"]
         await status.edit_text(_short(f"🏁 Practice debrief\n\n{out}"), reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("🔁 Practice again", callback_data="pa:0")]]))
@@ -1383,6 +1420,28 @@ async def end_practice(msg):
         await status.edit_text(_friendly_error(e))
     finally:
         _practice.clear()
+
+
+FILLERS = ("um", "uh", "umm", "like", "basically", "actually", "you know", "i mean", "literally")
+
+
+def _voice_feedback(lines):
+    """How he SPOKE in a voice practice (like Yoodli): pace and filler words, counted from his voice notes."""
+    words = sum(len(t.split()) for t, _ in lines)
+    secs = sum(d for _, d in lines)
+    if not lines or words < 15 or secs < 5:
+        return ""
+    counts = {f: len(re.findall(rf"\b{f}\b", " ".join(t.lower() for t, _ in lines))) for f in FILLERS}
+    top = sorted(((n, f) for f, n in counts.items() if n), reverse=True)[:3]
+    fillers = sum(counts.values())
+    wpm = round(words / secs * 60)
+    pace = ("a bit fast: slow down, pauses sound confident" if wpm > 170 else
+            "a bit slow: keep it moving" if wpm < 110 else "a good, calm pace")
+    out = f"\n\n🎙 Your voice: {wpm} words a minute ({pace})."
+    if top:
+        out += (f"\nFiller words: {fillers} (" + ", ".join(f'"{f}" ×{n}' for n, f in top) + "). "
+                + ("Replace them with a short pause." if fillers * 100 / words > 3 else "Very few, nice."))
+    return out
 
 
 async def on_practice_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1544,24 +1603,194 @@ async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def daily_tip(context: ContextTypes.DEFAULT_TYPE):
-    """One old save a day, so it comes back before it's forgotten (each save rotates; least recent first)."""
+    """The 2-minute daily review (like Readwise's daily review): 3 moves come back as quick cards, picked by
+    spaced repetition (due ones first, then new ones closest to his goal)."""
     try:
         if await asyncio.to_thread(db.get_setting, "reminders", "on") == "off":
             return
-        row = await asyncio.to_thread(db.pick_tip)
-        if not row:
-            return
-        i, created, stype, url, title, topic, summary, points = row
-        best = "\n".join(f"• {p}" for p in (points or [])[:3])
-        text = f"💡 Remember this? (you saved it on {created:%d %b})\n\n{title}\n\n{best}"
-        kb = _details_button(i).inline_keyboard + ((InlineKeyboardButton("🔕 Pause reminders", callback_data="rem:off"),),)
-        await context.bot.send_message(OWNER, _short(text), reply_markup=InlineKeyboardMarkup(kb),
-                                       disable_web_page_preview=True)
+        streak = await _streak()
+        await context.bot.send_message(OWNER, f"🧠 Your 2-minute review: {REVIEW_CARDS} moves for your goal."
+                                       + (f"\n🔥 Streak: {streak} days" if streak > 1 else ""),
+                                       reply_markup=InlineKeyboardMarkup([
+                                           [InlineKeyboardButton("▶️ Start", callback_data="rv:go:0:d")],
+                                           [InlineKeyboardButton("🔕 Pause reminders", callback_data="rem:off")]]))
     except Exception:
-        log.exception("daily tip failed")
+        log.exception("daily review failed")
 
 
 IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+
+
+# ---------- Daily review + quiz: a move comes back as a question, he thinks, then taps to see it ----------
+
+REVIEW_CARDS = 3
+_goal_vec = {}  # date -> embedding of his profile (the goal new cards are picked for)
+
+
+def _today():
+    return dt.datetime.now(IST).date()
+
+
+async def _streak():
+    last = await asyncio.to_thread(db.get_setting, "review_last", "")
+    n = int(await asyncio.to_thread(db.get_setting, "review_streak", "0") or 0)
+    alive = last in (str(_today()), str(_today() - dt.timedelta(days=1)))
+    return n if alive else 0
+
+
+async def _bump_streak():
+    today = str(_today())
+    last = await asyncio.to_thread(db.get_setting, "review_last", "")
+    if last == today:
+        return await _streak()
+    n = (await _streak()) + 1
+    await asyncio.to_thread(db.set_setting, "review_streak", str(n))
+    await asyncio.to_thread(db.set_setting, "review_last", today)
+    return n
+
+
+async def send_review_card(bot, where, after_move=None):
+    """where: "d" = daily review, or a save id = quiz on that one save."""
+    if where == "d":
+        done = await asyncio.to_thread(db.reviewed_today)
+        if done >= REVIEW_CARDS:
+            streak = await _bump_streak()
+            await bot.send_message(OWNER, f"✅ Done for today!" + (f" 🔥 {streak}-day streak." if streak > 1 else "")
+                                   + "\nSmall reps every day is how it sticks.")
+            return
+        day = str(_today())
+        if day not in _goal_vec:
+            profile = await asyncio.to_thread(db.get_setting, "profile", "")
+            _goal_vec.clear()
+            _goal_vec[day] = await asyncio.to_thread(brain.embed, profile, True) if profile else None
+        m = await asyncio.to_thread(db.next_review_move, _goal_vec[day])
+        label = f"Card {done + 1}/{REVIEW_CARDS}"
+    else:
+        m = await asyncio.to_thread(db.next_review_move, None, int(where), after_move)
+        label = "Quiz"
+    if not m:
+        await bot.send_message(OWNER, "✅ That's all of them!" if where != "d" else "Nothing to review yet. Save a few "
+                               "videos first.")
+        return
+    await bot.send_message(OWNER, f"🧠 {label}\n\n{m[1]}\n\nWhat would you do or say? Think first, then tap.",
+                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                               "👀 Show the move", callback_data=f"rv:show:{m[11]}:{where}")]]))
+
+
+async def on_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """rv:go:0:<where> start · rv:show:<move>:<where> reveal · rv:ok|no:<move>:<where> knew it / not yet."""
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    _, act, move_id, where = q.data.split(":")
+    move_id = int(move_id)
+    if act == "go":
+        await q.edit_message_reply_markup(None)
+        await send_review_card(context.bot, where)
+    elif act == "show":
+        m = await asyncio.to_thread(db.move, move_id)
+        if not m:
+            await q.edit_message_text("That move was removed. Tap ▶️ again for the next one.")
+            return
+        text = q.message.text.replace("\n\nWhat would you do or say? Think first, then tap.", "")
+        text += f"\n\n✅ {m[2]}"
+        if m[3]:
+            text += f'\n💬 "{m[3]}"'
+        if m[4]:
+            text += f"\n💡 {m[4]}"
+        text += f"\n— {m[12] + ', ' if m[12] and m[12] not in m[7] else ''}{m[7]}"
+        await q.edit_message_text(_short(text), reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Knew it", callback_data=f"rv:ok:{move_id}:{where}"),
+            InlineKeyboardButton("🔁 Not yet", callback_data=f"rv:no:{move_id}:{where}")]]))
+    else:
+        await asyncio.to_thread(db.review_mark, move_id, act == "ok")
+        await q.edit_message_reply_markup(None)
+        await send_review_card(context.bot, where, after_move=move_id)
+
+
+# ---------- Journey: the next evening, "how did it go?" ----------
+
+FOLLOWUP_HOURS = (10, 21)  # India time: no "how did it go?" at night
+
+
+def _followup_time():
+    """Tomorrow 7 PM India time: after he's had the day to try it."""
+    now = dt.datetime.now(IST)
+    return (now + dt.timedelta(days=1)).replace(hour=19, minute=0, second=0, microsecond=0)
+
+
+async def followups(context: ContextTypes.DEFAULT_TYPE):
+    """Every 30 minutes, 10 AM to 9 PM India time: ask about one past situation whose time has come."""
+    try:
+        if not FOLLOWUP_HOURS[0] <= dt.datetime.now(IST).hour < FOLLOWUP_HOURS[1]:
+            return
+        for jid, at, situation in await asyncio.to_thread(db.due_followups, 1):
+            sent = await context.bot.send_message(
+                OWNER, f"🧭 On {at.astimezone(IST):%a} you asked me about:\n“{situation}”\n\nHow did it go?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Worked", callback_data=f"fu:{jid}:w"),
+                     InlineKeyboardButton("😐 So-so", callback_data=f"fu:{jid}:m"),
+                     InlineKeyboardButton("❌ Didn't work", callback_data=f"fu:{jid}:n")],
+                    [InlineKeyboardButton("⏭ Not yet", callback_data=f"fu:{jid}:s"),
+                     InlineKeyboardButton("🔕 Don't ask", callback_data=f"fu:{jid}:x")]]))
+            # if he doesn't answer, ask once more two days later; after that, let it go
+            again = None if at < dt.datetime.now(IST) - dt.timedelta(days=2) else _followup_time() + dt.timedelta(days=1)
+            await asyncio.to_thread(db.set_followup, jid, sent.message_id, again)
+    except Exception:
+        log.exception("follow-up failed")
+
+
+async def on_followup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    _, jid, choice = q.data.split(":")
+    jid = int(jid)
+    if choice == "s":
+        await asyncio.to_thread(db.set_followup, jid, q.message.message_id, _followup_time() + dt.timedelta(days=1))
+        await q.edit_message_text(q.message.text + "\n\n⏭ OK, I'll ask again in a couple of days.")
+        return
+    if choice == "x":
+        await asyncio.to_thread(db.set_followup, jid, q.message.message_id, None)
+        await q.edit_message_text(q.message.text + "\n\n🔕 OK, I won't ask about this one again.")
+        return
+    result = {"w": 1, "m": 0, "n": -1}[choice]
+    save_ids = await asyncio.to_thread(db.set_result, jid, result)
+    if result == 1:
+        for sid in save_ids:
+            await asyncio.to_thread(db.mark_proven, sid)  # moves that worked come first next time
+    reply = {1: "✅ Nice! I'll suggest what worked first next time.",
+             0: "😐 Noted. Next time I'll build on what half-worked.",
+             -1: "❌ Thanks for being honest. Next time I'll try a different move."}[result]
+    await q.edit_message_text(q.message.text + f"\n\n{reply}\nWant to add what happened? Reply to this message "
+                                               f"(optional, text or voice).")
+
+
+# ---------- Named mentors ----------
+
+async def show_mentors(msg):
+    names = await asyncio.to_thread(db.creators, 12)
+    if not names:
+        await msg.reply_text("I don't know the names of your mentors yet. Save a few more videos.")
+        return
+    lines = "\n".join(f"• {n} ({c} save{'s' if c > 1 else ''})" for n, c in names)
+    _awaiting.pop("mentor", None)
+    await msg.reply_text(f"👥 The mentors you learn from:\n{lines}\n\nTap one to ask what they'd tell you:",
+                         reply_markup=InlineKeyboardMarkup(
+                             [[InlineKeyboardButton(f"💬 {n}"[:40], callback_data=_fit_bytes(f"mn:{n}", 64))]
+                              for n, _ in names[:6]]))
+
+
+async def on_mentor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != OWNER:
+        return
+    await q.answer()
+    name = q.data.split(":", 1)[1]
+    _awaiting["mentor"] = name
+    await q.message.reply_text(f"💬 What do you want to ask {name}? Type or say your situation.")
 
 
 _last_recap = {}
@@ -1574,12 +1803,13 @@ def _listen_recap():
 async def build_recap():
     rows = await asyncio.to_thread(db.since, 7)
     throwback = await asyncio.to_thread(db.random_older, 7)
-    if not rows:
+    journal = await asyncio.to_thread(db.journal_since, 7)
+    if not rows and not journal:
         msg = "🧠 Sunday recap: you didn't save anything this week. Share one useful video today 🙂"
         if throwback:
             msg += f"\n\n🔁 From your past: #{throwback[0]} {throwback[4]}\n{throwback[6]}"
         return msg
-    return await asyncio.to_thread(brain.weekly_recap, rows, throwback)
+    return await asyncio.to_thread(brain.weekly_recap, rows, throwback, journal)
 
 
 async def weekly_recap(context: ContextTypes.DEFAULT_TYPE):
@@ -1678,11 +1908,15 @@ def build_app():
     app.add_handler(CallbackQueryHandler(on_next_step, pattern=r"^(ls|pr|ag|pa|lr|rt|ga):\d+$"))
     app.add_handler(CallbackQueryHandler(on_save_or_ask, pattern=r"^(sv|ak):\d+$"))
     app.add_handler(CallbackQueryHandler(on_topic, pattern=r"^t:"))
+    app.add_handler(CallbackQueryHandler(on_review, pattern=r"^rv:(go|show|ok|no):\d+:(d|\d+)$"))
+    app.add_handler(CallbackQueryHandler(on_followup, pattern=r"^fu:\d+:[wmnsx]$"))
+    app.add_handler(CallbackQueryHandler(on_mentor, pattern=r"^mn:"))
     app.add_handler(MessageHandler(~me, ignore_strangers))
 
     app.job_queue.run_daily(daily_ping, time=dt.time(hour=3, minute=0))
     app.job_queue.run_once(daily_ping, when=5)
     app.job_queue.run_repeating(queue_tick, interval=10 * 60, first=30)
+    app.job_queue.run_repeating(followups, interval=30 * 60, first=120)  # "how did it go?" (10 AM - 9 PM only)
     # Daily reminder Mon-Sat 9:00 AM India time; Sunday 9:00 AM is the weekly recap instead (0 = Sunday)
     app.job_queue.run_daily(daily_tip, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(1, 2, 3, 4, 5, 6))
     app.job_queue.run_daily(weekly_recap, time=dt.time(hour=9, minute=0, tzinfo=IST), days=(0,))

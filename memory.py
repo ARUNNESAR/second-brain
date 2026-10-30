@@ -6,6 +6,7 @@
   not a guess, for "does it remember?".
 """
 import logging
+import time
 
 import brain
 import db
@@ -49,6 +50,8 @@ def index_save(save_id):
     return len(pieces)
 
 
+MOVE_FLOOR = 0.63  # a question whose best move (for his own words) scores below this isn't covered by his saves:
+                   # tested Oct 31: off-topic questions <= 0.62, real situations >= 0.67
 MOVE_PART = 20_000  # characters read per pass when finding moves (~15 minutes of a video)
 
 
@@ -68,12 +71,26 @@ def index_moves(save_id, row=None):
     if not row:
         return 0
     _, _, _, _, title, topic, summary, points, content = row
-    moves = []
+    moves, creator = [], ""
     for part in _parts(content or ""):  # long videos in parts: one pass over 90 minutes skims and misses most moves
-        moves += brain.extract_moves(title, topic, summary, points, part)
+        found = brain.extract_moves(title, topic, summary, points, part)
+        moves += found.moves
+        creator = creator or found.creator
     vecs = brain.embed_many([brain.move_text(m) for m in moves]) if moves else []
     db.replace_moves(save_id, [(m.situation, m.move, m.say, m.why, m.avoid, v) for m, v in zip(moves, vecs)])
+    if creator:
+        db.set_creator(save_id, creator, only_if_empty=True)
     return len(moves)
+
+
+def creators_missing(batch=25):
+    """Name the mentor of every save that has none yet (older saves). Returns how many were looked at."""
+    items = db.saves_without_creator()
+    for i in range(0, len(items), batch):
+        part = items[i:i + batch]
+        for (save_id, *_), name in zip(part, brain.creators_for(part)):
+            db.set_creator(save_id, name or "-")  # "-" = looked, nobody named: don't ask again
+    return len(items)
 
 
 def moves_missing(limit=5):
@@ -103,12 +120,34 @@ def search(question, limit=6):
     return db.hybrid_search(question, brain.embed(question, True), limit)
 
 
-def mentor_context(question, saves=6, moves=15):
-    """What the mentor needs for one question: the best-fitting moves, and the saves they come from (the saves of
-    the top moves first, then the best-matching saves). One embedding for both searches."""
-    v = brain.embed(question, True)
-    found_moves = db.search_moves(question, v, moves)
+def mentor_context(question, saves=6, moves=15, profile=""):
+    """What the mentor needs for one question. Steps, like the best second-brain tools do it:
+    1. understand: rewrite his message into 3 clear situations (any wording, Tanglish too);
+    2. search moves with his words AND the 3 rewrites, keep each move's best score;
+    3. second look: re-rank the top 40 by "would this actually help him now";
+    4. add his past similar situations and how they went.
+    Returns (saves, moves, ctx) - saves: of the top moves first, then the best-matching saves;
+    ctx: {"plan", "past", "mentors", "vector"}."""
+    mentors = _mentors()
+    try:
+        plan = brain.plan_query(question, mentors)
+    except Exception:  # quota or a bad reply: search with his own words only
+        log.exception("query plan failed")
+        plan = None
+    queries = [question] + (plan.situations if plan else [])
+    vecs = brain.embed_many(queries, for_query=True)
+    v = vecs[0]
+    mentor = plan.mentor if plan and plan.mentor in mentors else ""
+    found = db.search_moves_multi(queries, vecs, 60, creator=mentor)
+    direct = max((m[13] or 0 for m in found), default=0)  # best match for his OWN words: off-topic check
+    pool, per = [], {}
+    for m in found:
+        per[m[0]] = per.get(m[0], 0) + 1
+        if per[m[0]] <= 3 and len(pool) < 40:  # max 3 per save: one long podcast can't crowd out the rest
+            pool.append(m)
+    found_moves = brain.rerank(question, profile, pool, keep=moves) if len(pool) > 3 else pool
     rows = db.hybrid_search(question, v, saves)
+    past = db.similar_journal(v)
     have = {r[0] for r in rows}
     extra = []
     for sid in dict.fromkeys(m[0] for m in found_moves[:6]):
@@ -116,7 +155,17 @@ def mentor_context(question, saves=6, moves=15):
             row = db.get(sid)
             if row:
                 extra.append(tuple(row) + (max(m[6] for m in found_moves if m[0] == sid),))
-    return extra + rows, found_moves
+    return extra + rows, found_moves, {"plan": plan, "past": past, "mentors": mentors, "vector": v, "direct": direct}
+
+
+_mentor_cache = {"at": 0, "names": []}
+
+
+def _mentors():
+    """Names of the mentors in his saves (cached 10 minutes: saves one database round trip per question)."""
+    if time.time() - _mentor_cache["at"] > 600:
+        _mentor_cache.update(at=time.time(), names=[n for n, _ in db.creators()])
+    return _mentor_cache["names"]
 
 
 def memory_test(n=20):
